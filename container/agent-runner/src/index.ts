@@ -389,6 +389,10 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
+  // Enable Todoist MCP server only when token is present and group is allowed
+  const todoistGroups = sdkEnv.TODOIST_GROUPS?.split(',').map(g => g.trim()) || [];
+  const enableTodoist = !!(sdkEnv.TODOIST_API_TOKEN && (todoistGroups.length === 0 || todoistGroups.includes(containerInput.groupFolder)));
+
   for await (const message of query({
     prompt: stream,
     options: {
@@ -407,7 +411,8 @@ async function runQuery(
         'TeamCreate', 'TeamDelete', 'SendMessage',
         'TodoWrite', 'ToolSearch', 'Skill',
         'NotebookEdit',
-        'mcp__nanoclaw__*'
+        'mcp__nanoclaw__*',
+        ...(enableTodoist ? ['mcp__todoist__*'] : []),
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -423,6 +428,15 @@ async function runQuery(
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
           },
         },
+        ...(enableTodoist ? {
+          todoist: {
+            command: 'mcp-todoist',
+            args: [],
+            env: {
+              TODOIST_API_TOKEN: sdkEnv.TODOIST_API_TOKEN!,
+            },
+          },
+        } : {}),
       },
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
