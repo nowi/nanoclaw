@@ -43,7 +43,6 @@ export interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   imageAttachments?: Array<{ relativePath: string; mediaType: string }>;
-
 }
 
 export interface ContainerOutput {
@@ -218,6 +217,7 @@ function buildVolumeMounts(
 function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
+  group?: RegisteredGroup,
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
@@ -248,6 +248,14 @@ function buildContainerArgs(
   const todoistEnv = readEnvFile(['TODOIST_API_TOKEN', 'TODOIST_GROUPS']);
   for (const [key, value] of Object.entries(todoistEnv)) {
     args.push('-e', `${key}=${value}`);
+  }
+
+  // Pass group-specific secrets from .env (e.g. GH_TOKEN for GitHub CLI access)
+  if (group?.containerConfig?.allowedSecrets?.length) {
+    const secretEnv = readEnvFile(group.containerConfig.allowedSecrets);
+    for (const [key, value] of Object.entries(secretEnv)) {
+      args.push('-e', `${key}=${value}`);
+    }
   }
 
   // Run as host user so bind-mounted files are accessible.
@@ -287,7 +295,7 @@ export async function runContainerAgent(
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
-  const containerArgs = buildContainerArgs(mounts, containerName);
+  const containerArgs = buildContainerArgs(mounts, containerName, group);
 
   logger.debug(
     {
