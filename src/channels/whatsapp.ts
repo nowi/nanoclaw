@@ -12,7 +12,12 @@ import makeWASocket, {
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
 
-import { ASSISTANT_HAS_OWN_NUMBER, ASSISTANT_NAME, GROUPS_DIR, STORE_DIR } from '../config.js';
+import {
+  ASSISTANT_HAS_OWN_NUMBER,
+  ASSISTANT_NAME,
+  GROUPS_DIR,
+  STORE_DIR,
+} from '../config.js';
 import {
   getLastGroupSync,
   getLatestMessage,
@@ -68,7 +73,10 @@ export class WhatsAppChannel implements Channel {
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
     const { version } = await fetchLatestWaWebVersion({}).catch((err) => {
-      logger.warn({ err }, 'Failed to fetch latest WA Web version, using default');
+      logger.warn(
+        { err },
+        'Failed to fetch latest WA Web version, using default',
+      );
       return { version: undefined };
     });
     this.sock = makeWASocket({
@@ -97,9 +105,18 @@ export class WhatsAppChannel implements Channel {
 
       if (connection === 'close') {
         this.connected = false;
-        const reason = (lastDisconnect?.error as { output?: { statusCode?: number } })?.output?.statusCode;
+        const reason = (
+          lastDisconnect?.error as { output?: { statusCode?: number } }
+        )?.output?.statusCode;
         const shouldReconnect = reason !== DisconnectReason.loggedOut;
-        logger.info({ reason, shouldReconnect, queuedMessages: this.outgoingQueue.length }, 'Connection closed');
+        logger.info(
+          {
+            reason,
+            shouldReconnect,
+            queuedMessages: this.outgoingQueue.length,
+          },
+          'Connection closed',
+        );
 
         if (shouldReconnect) {
           this.scheduleReconnect(1);
@@ -170,7 +187,13 @@ export class WhatsAppChannel implements Channel {
 
         // Always notify about chat metadata for group discovery
         const isGroup = chatJid.endsWith('@g.us');
-        this.opts.onChatMetadata(chatJid, timestamp, undefined, 'whatsapp', isGroup);
+        this.opts.onChatMetadata(
+          chatJid,
+          timestamp,
+          undefined,
+          'whatsapp',
+          isGroup,
+        );
 
         // Only deliver full message for registered groups
         const groups = this.opts.registeredGroups();
@@ -224,7 +247,10 @@ export class WhatsAppChannel implements Channel {
               const transcript = await transcribeAudioMessage(msg, this.sock);
               if (transcript) {
                 finalContent = `[Voice: ${transcript}]`;
-                logger.info({ chatJid, length: transcript.length }, 'Transcribed voice message');
+                logger.info(
+                  { chatJid, length: transcript.length },
+                  'Transcribed voice message',
+                );
               } else {
                 finalContent = '[Voice Message - transcription unavailable]';
               }
@@ -300,7 +326,10 @@ export class WhatsAppChannel implements Channel {
 
     if (!this.connected) {
       this.outgoingQueue.push({ jid, text: prefixed });
-      logger.info({ jid, length: prefixed.length, queueSize: this.outgoingQueue.length }, 'WA disconnected, message queued');
+      logger.info(
+        { jid, length: prefixed.length, queueSize: this.outgoingQueue.length },
+        'WA disconnected, message queued',
+      );
       return;
     }
     try {
@@ -309,7 +338,10 @@ export class WhatsAppChannel implements Channel {
     } catch (err) {
       // If send fails, queue it for retry on reconnect
       this.outgoingQueue.push({ jid, text: prefixed });
-      logger.warn({ jid, err, queueSize: this.outgoingQueue.length }, 'Failed to send, message queued');
+      logger.warn(
+        { jid, err, queueSize: this.outgoingQueue.length },
+        'Failed to send, message queued',
+      );
     }
   }
 
@@ -435,7 +467,10 @@ export class WhatsAppChannel implements Channel {
     // Check local cache first
     const cached = this.lidToPhoneMap[lidUser];
     if (cached) {
-      logger.debug({ lidJid: jid, phoneJid: cached }, 'Translated LID to phone JID (cached)');
+      logger.debug(
+        { lidJid: jid, phoneJid: cached },
+        'Translated LID to phone JID (cached)',
+      );
       return cached;
     }
 
@@ -445,7 +480,10 @@ export class WhatsAppChannel implements Channel {
       if (pn) {
         const phoneJid = `${pn.split('@')[0].split(':')[0]}@s.whatsapp.net`;
         this.lidToPhoneMap[lidUser] = phoneJid;
-        logger.info({ lidJid: jid, phoneJid }, 'Translated LID to phone JID (signalRepository)');
+        logger.info(
+          { lidJid: jid, phoneJid },
+          'Translated LID to phone JID (signalRepository)',
+        );
         return phoneJid;
       }
     } catch (err) {
@@ -459,12 +497,18 @@ export class WhatsAppChannel implements Channel {
     if (this.flushing || this.outgoingQueue.length === 0) return;
     this.flushing = true;
     try {
-      logger.info({ count: this.outgoingQueue.length }, 'Flushing outgoing message queue');
+      logger.info(
+        { count: this.outgoingQueue.length },
+        'Flushing outgoing message queue',
+      );
       while (this.outgoingQueue.length > 0) {
         const item = this.outgoingQueue.shift()!;
         // Send directly — queued items are already prefixed by sendMessage
         await this.sock.sendMessage(item.jid, { text: item.text });
-        logger.info({ jid: item.jid, length: item.text.length }, 'Queued message sent');
+        logger.info(
+          { jid: item.jid, length: item.text.length },
+          'Queued message sent',
+        );
       }
     } finally {
       this.flushing = false;
@@ -475,7 +519,9 @@ export class WhatsAppChannel implements Channel {
 registerChannel('whatsapp', (opts: ChannelOpts) => {
   const authDir = path.join(STORE_DIR, 'auth');
   if (!fs.existsSync(path.join(authDir, 'creds.json'))) {
-    logger.warn('WhatsApp: credentials not found. Run /add-whatsapp to authenticate.');
+    logger.warn(
+      'WhatsApp: credentials not found. Run /add-whatsapp to authenticate.',
+    );
     return null;
   }
   return new WhatsAppChannel(opts);
