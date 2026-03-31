@@ -11,20 +11,15 @@ Query the einkflow dev server REST API.
 ## Connection Details
 
 - **Base URL**: `https://dev.einkflow.com`
-- **Auth**: JWT Bearer token via rotating refresh token
-- **Token file**: `~/.einkflow-refresh-token` (persists the latest refresh token)
+- **Auth**: Personal Access Token (PAT) via Bearer header
+- **Token file**: `~/.einkflow-pat-token` (persists the PAT)
 
 ## Usage
 
-### Step 1: Get an access token (refreshes and persists the rotated token)
+### Step 1: Read the PAT from disk
 
 ```bash
-REFRESH=$(cat ~/.einkflow-refresh-token) && \
-RESPONSE=$(curl -s -X POST "https://dev.einkflow.com/api/v1/auth/refresh" \
-  -H "Content-Type: application/json" \
-  -d "{\"refreshToken\":\"$REFRESH\"}") && \
-TOKEN=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['accessToken'])") && \
-echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['refreshToken'])" > ~/.einkflow-refresh-token
+TOKEN=$(cat ~/.einkflow-pat-token)
 ```
 
 ### Step 2: Use the token for API requests
@@ -33,7 +28,7 @@ echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['refr
 curl -s -H "Authorization: Bearer $TOKEN" "https://dev.einkflow.com/api/v1/<endpoint>" | python3 -m json.tool
 ```
 
-**Important:** The access token expires after 15 minutes. The refresh token **rotates on each use** (old one is revoked, new one is saved to `~/.einkflow-refresh-token`). If the refresh fails with 401, ask the user to provide a new refresh token and save it to `~/.einkflow-refresh-token`.
+**Important:** PAT tokens do not expire (unless revoked by the user). No refresh flow is needed — just read the token from `~/.einkflow-pat-token` and use it directly. If a request returns 401, the token may have been revoked — ask the user to provide a new PAT.
 
 No port-forward is needed — the API is publicly accessible via the Kubernetes ingress at `dev.einkflow.com`.
 
