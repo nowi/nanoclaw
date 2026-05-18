@@ -12,14 +12,14 @@ Query the einkflow dev server REST API.
 
 - **Base URL**: `https://dev.einkflow.com`
 - **Auth**: Personal Access Token (PAT) via Bearer header
-- **Token file**: `~/.einkflow-pat-token` (persists the PAT)
+- **Token source**: `$EINKFLOW_PAT` env var (injected by NanoClaw via `allowedSecrets`); falls back to `~/.einkflow-pat-token` for local/host use
 
 ## Usage
 
-### Step 1: Read the PAT from disk
+### Step 1: Read the PAT
 
 ```bash
-TOKEN=$(cat ~/.einkflow-pat-token)
+TOKEN="${EINKFLOW_PAT:-$(cat ~/.einkflow-pat-token 2>/dev/null)}"
 ```
 
 ### Step 2: Use the token for API requests
@@ -28,7 +28,7 @@ TOKEN=$(cat ~/.einkflow-pat-token)
 curl -s -H "Authorization: Bearer $TOKEN" "https://dev.einkflow.com/api/v1/<endpoint>" | python3 -m json.tool
 ```
 
-**Important:** PAT tokens do not expire (unless revoked by the user). No refresh flow is needed — just read the token from `~/.einkflow-pat-token` and use it directly. If a request returns 401, the token may have been revoked — ask the user to provide a new PAT.
+**Important:** PAT tokens do not expire (unless revoked by the user). No refresh flow is needed. Inside a NanoClaw container, the token arrives as `$EINKFLOW_PAT` (must be listed in the group's `allowedSecrets`). On the host, the file at `~/.einkflow-pat-token` is the fallback. If a request returns 401, the token may have been revoked — ask the user to provide a new PAT.
 
 No port-forward is needed — the API is publicly accessible via the Kubernetes ingress at `dev.einkflow.com`.
 
