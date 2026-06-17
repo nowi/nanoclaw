@@ -23,6 +23,7 @@ import {
 } from './container-runner.js';
 import {
   cleanupOrphans,
+  ensureContainerImage,
   ensureContainerRuntimeRunning,
   PROXY_BIND_HOST,
 } from './container-runtime.js';
@@ -574,13 +575,22 @@ function recoverPendingMessages(): void {
   }
 }
 
-function ensureContainerSystemRunning(): void {
+async function ensureContainerSystemRunning(): Promise<void> {
   ensureContainerRuntimeRunning();
+  // Rebuild the agent image if it's missing (e.g. swept by `docker system
+  // prune`) so a restart self-heals instead of failing every message.
+  const imageReady = await ensureContainerImage();
+  if (!imageReady) {
+    logger.error(
+      'Agent image is missing and the rebuild failed — agents cannot run. ' +
+        'Run ./container/build.sh manually and restart.',
+    );
+  }
   cleanupOrphans();
 }
 
 async function main(): Promise<void> {
-  ensureContainerSystemRunning();
+  await ensureContainerSystemRunning();
   initDatabase();
   logger.info('Database initialized');
   loadState();
