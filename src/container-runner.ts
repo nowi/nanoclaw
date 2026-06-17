@@ -22,7 +22,9 @@ import { logger } from './logger.js';
 import {
   CONTAINER_HOST_GATEWAY,
   CONTAINER_RUNTIME_BIN,
+  ensureContainerImage,
   hostGatewayArgs,
+  isMissingImageError,
   readonlyMountArgs,
   stopContainer,
 } from './container-runtime.js';
@@ -582,6 +584,26 @@ export async function runContainerAgent(
           },
           'Container exited with error',
         );
+
+        // Self-heal: a missing image (e.g. swept by `docker system prune`)
+        // makes every spawn fail with exit 125. Rebuild it before resolving so
+        // the queue's existing retry-with-backoff recovers without a restart.
+        // The build is de-duplicated, so concurrent failures share one rebuild.
+        if (isMissingImageError(stderr)) {
+          logger.warn(
+            { group: group.name },
+            'Container image missing — rebuilding before retry',
+          );
+          ensureContainerImage().finally(() => {
+            resolve({
+              status: 'error',
+              result: null,
+              error:
+                'Agent image was missing; rebuilt it, retrying on next attempt.',
+            });
+          });
+          return;
+        }
 
         resolve({
           status: 'error',

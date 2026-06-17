@@ -2,10 +2,12 @@
  * Container runtime abstraction for NanoClaw.
  * All runtime-specific logic lives here so swapping runtimes means changing one file.
  */
-import { execSync } from 'child_process';
+import { execSync, spawn } from 'child_process';
 import fs from 'fs';
 import os from 'os';
+import path from 'path';
 
+import { CONTAINER_IMAGE } from './config.js';
 import { logger } from './logger.js';
 
 /** The container runtime binary name. */
@@ -98,6 +100,86 @@ export function ensureContainerRuntimeRunning(): void {
     );
     throw new Error('Container runtime is required but failed to start');
   }
+}
+
+/** Returns true if the agent container image is present locally. */
+export function containerImageExists(image: string = CONTAINER_IMAGE): boolean {
+  try {
+    execSync(`${CONTAINER_RUNTIME_BIN} image inspect ${image}`, {
+      stdio: 'pipe',
+      timeout: 15000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Detect a container-start failure caused by the image being absent
+ * (e.g. swept by `docker system prune`). Matches the runtime's
+ * "image not found" / "pull access denied" / "no such image" messages.
+ */
+export function isMissingImageError(stderr: string): boolean {
+  return /Unable to find image|repository does not exist|No such image|manifest( for .*)? unknown|pull access denied/i.test(
+    stderr,
+  );
+}
+
+// Single in-flight build shared across all callers, so concurrent failures
+// (multiple groups, startup + a spawn retry) trigger exactly one rebuild.
+let buildInFlight: Promise<boolean> | null = null;
+
+/** Rebuild the agent image via container/build.sh. De-duplicated while running. */
+export function buildContainerImage(): Promise<boolean> {
+  if (buildInFlight) return buildInFlight;
+
+  const buildScript = path.join(process.cwd(), 'container', 'build.sh');
+  logger.info({ image: CONTAINER_IMAGE }, 'Building agent container image');
+
+  buildInFlight = new Promise<boolean>((resolve) => {
+    const proc = spawn('bash', [buildScript], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, CONTAINER_RUNTIME: CONTAINER_RUNTIME_BIN },
+    });
+    const log = (data: Buffer) => {
+      for (const line of data.toString().trim().split('\n')) {
+        if (line) logger.debug({ build: true }, line);
+      }
+    };
+    proc.stdout.on('data', log);
+    proc.stderr.on('data', log);
+    proc.on('close', (code) => {
+      buildInFlight = null;
+      if (code === 0) {
+        logger.info({ image: CONTAINER_IMAGE }, 'Agent image build complete');
+        resolve(true);
+      } else {
+        logger.error({ code }, 'Agent image build failed');
+        resolve(false);
+      }
+    });
+    proc.on('error', (err) => {
+      buildInFlight = null;
+      logger.error({ err }, 'Agent image build failed to start');
+      resolve(false);
+    });
+  });
+
+  return buildInFlight;
+}
+
+/**
+ * Ensure the agent image is present, building it if missing.
+ * Returns true once the image is available. Safe to call concurrently.
+ */
+export async function ensureContainerImage(): Promise<boolean> {
+  if (containerImageExists()) return true;
+  logger.warn(
+    { image: CONTAINER_IMAGE },
+    'Agent container image missing — rebuilding',
+  );
+  return buildContainerImage();
 }
 
 /** Kill orphaned NanoClaw containers from previous runs. */
