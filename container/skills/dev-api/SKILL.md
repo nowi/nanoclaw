@@ -159,9 +159,39 @@ Endpoints are under `/api/v1/` and `/api/v2/`. All JSON responses use an `ApiRes
 ### Email Webhook — `/api/emails` (not under /api/v1/)
 - `POST /api/emails/inbound` — SendGrid Inbound Parse webhook (multipart/form-data)
 
+## Direct Cluster Access (kubectl / doctl)
+
+The dev backend runs on a **DigitalOcean Kubernetes (DOKS)** cluster. For pod-level
+operations (logs, restarts, describing resources) you can talk to the cluster directly
+instead of going through the REST API.
+
+**Auth:** `doctl` reads `$DIGITALOCEAN_ACCESS_TOKEN`, injected by NanoClaw via the group's
+`allowedSecrets`. No `doctl auth init` is needed. The token is scoped to Kubernetes only.
+
+The container home directory is ephemeral, so generate the kubeconfig once at the start of
+each container session, then use `kubectl` normally:
+
+```bash
+# Write ~/.kube/config for the einkflow dev cluster (name: dev-kube, region fra1)
+doctl kubernetes cluster kubeconfig save dev-kube
+
+# kubectl now works against the cluster
+kubectl get pods
+kubectl logs deploy/einkflow-deployment --tail=50
+```
+
+The main app deployment is `einkflow-deployment`; the stack also includes
+`einkflow-worker-deployment`, `db-deployment`, `minio-deployment`, `neo4j-deployment`,
+`rabbitmq-deployment`, and the extractor pods (scrapling/trafilatura/ytdlp). If the
+cluster name ever changes, rediscover it with `doctl kubernetes cluster list`.
+
+Re-run `kubernetes cluster kubeconfig save` if a later kubectl command reports the config
+is missing (a fresh container has no `~/.kube/config` until you generate it).
+
 ## Troubleshooting
 
-If the API returns **502/504**, the einkflow pod likely has a stale DB connection pool:
+If the API returns **502/504**, the einkflow pod likely has a stale DB connection pool
+(run the `doctl kubernetes cluster kubeconfig save` step above first so `kubectl` is wired up):
 
 ```bash
 # Check pod status

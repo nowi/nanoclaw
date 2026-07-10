@@ -29,6 +29,18 @@ RUN apt-get update && apt-get install -y \
     && apt-get update && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
 
+# Install kubectl + doctl for direct DigitalOcean Kubernetes (DOKS) access.
+# DOKS kubeconfigs use doctl as their exec credential plugin, so both are needed.
+# Arch-aware: dpkg --print-architecture yields amd64/arm64, matching upstream asset
+# names. doctl version is resolved from GitHub's latest release — if a rebuild hits
+# the GitHub API rate limit, replace the DOCTL_VERSION line with a pinned "1.xxx.x".
+RUN ARCH="$(dpkg --print-architecture)" \
+    && curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/${ARCH}/kubectl" -o /usr/local/bin/kubectl \
+    && chmod +x /usr/local/bin/kubectl \
+    && DOCTL_VERSION="$(curl -fsSL https://api.github.com/repos/digitalocean/doctl/releases/latest | grep -oP '"tag_name":\s*"v\K[^"]+')" \
+    && curl -fsSL "https://github.com/digitalocean/doctl/releases/download/v${DOCTL_VERSION}/doctl-${DOCTL_VERSION}-linux-${ARCH}.tar.gz" | tar -xz -C /usr/local/bin doctl \
+    && chmod +x /usr/local/bin/doctl
+
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
