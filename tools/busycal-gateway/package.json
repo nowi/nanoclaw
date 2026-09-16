@@ -1,0 +1,10 @@
+{
+  "name": "nanoclaw-busycal-gateway",
+  "private": true,
+  "type": "module",
+  "description": "Loopback HTTP MCP gateway in front of the BusyCal MCP bridge, exposing a read-only tool subset to NanoClaw agents",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "zod": "3.25.76"
+  }
+}
