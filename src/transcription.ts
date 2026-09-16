@@ -76,9 +76,13 @@ export async function transcribeVoiceNote(audioPath: string): Promise<string | n
   const tmpWav = path.join(os.tmpdir(), `${id}.wav`);
   try {
     // whisper.cpp wants 16 kHz mono PCM wav.
-    await execFileAsync(FFMPEG_BIN, ['-loglevel', 'error', '-i', audioPath, '-ar', '16000', '-ac', '1', '-f', 'wav', '-y', tmpWav], {
-      timeout: 30_000,
-    });
+    await execFileAsync(
+      FFMPEG_BIN,
+      ['-loglevel', 'error', '-i', audioPath, '-ar', '16000', '-ac', '1', '-f', 'wav', '-y', tmpWav],
+      {
+        timeout: 30_000,
+      },
+    );
     const { stdout } = await execFileAsync(
       WHISPER_BIN,
       ['-m', WHISPER_MODEL, '-f', tmpWav, '-l', WHISPER_LANG, '--no-timestamps', '-nt'],
