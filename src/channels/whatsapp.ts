@@ -42,6 +42,7 @@ import { isSafeAttachmentName } from '../attachment-safety.js';
 import { DATA_DIR } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
+import { transcribeVoiceNote, withVoiceTranscript } from '../transcription.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
 import type {
@@ -862,6 +863,20 @@ registerChannelAdapter('whatsapp', {
             // sent even when it couldn't be fetched — instead of silently
             // dropping the attachment (or the whole message, if uncaptioned).
             content = appendMediaFailureNote(content, failures);
+
+            // Local customization (v1 parity, nowi): voice notes are
+            // transcribed on the host with whisper.cpp and delivered as
+            // `[Voice: …]` text — the agent can't listen to the .ogg.
+            if (normalized.audioMessage?.ptt === true) {
+              const audio = attachments.find((a) => a.type === 'audio');
+              const transcript = audio ? await transcribeVoiceNote(path.join(DATA_DIR, audio.localPath)) : null;
+              content = withVoiceTranscript(content, transcript);
+              log.info('Voice note processed', {
+                chatJid,
+                transcribed: transcript !== null,
+                chars: transcript?.length ?? 0,
+              });
+            }
 
             // Skip empty protocol messages (no text and no attachments)
             if (!content && attachments.length === 0) continue;
