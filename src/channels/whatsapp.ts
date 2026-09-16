@@ -44,6 +44,7 @@ import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
 import { transcribeVoiceNote, withVoiceTranscript } from '../transcription.js';
 import { registerChannelAdapter } from './channel-registry.js';
+import { InboundKeyCache, bareWhatsAppMessageId, toReactionEmoji } from './whatsapp-reactions.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
 import type {
   ChannelAdapter,
@@ -435,6 +436,9 @@ registerChannelAdapter('whatsapp', {
 
     // Sent message cache for retry/re-encrypt requests
     const sentMessageCache = new Map<string, any>();
+    // Local customization (nowi): real keys of forwarded inbound messages, so
+    // agent reactions can target them (see whatsapp-reactions.ts).
+    const inboundKeyCache = new InboundKeyCache();
 
     // Group metadata cache with TTL
     const groupMetadataCache = new Map<string, { metadata: GroupMetadata; expiresAt: number }>();
@@ -907,6 +911,8 @@ registerChannelAdapter('whatsapp', {
               if (WHATSAPP_SHARED && content.startsWith(`${ASSISTANT_NAME}:`)) continue;
             }
 
+            inboundKeyCache.remember(msg.key);
+
             const isBotMessage = WHATSAPP_SHARED ? content.startsWith(`${ASSISTANT_NAME}:`) : false;
 
             // Check if this reply answers a pending question via slash command
@@ -1042,15 +1048,22 @@ registerChannelAdapter('whatsapp', {
 
         // Reaction → emoji on a message
         if (content.operation === 'reaction' && content.messageId && content.emoji) {
+          // Local customization (nowi): resolve the bare WhatsApp id, the real
+          // key (fromMe/participant) and the emoji character — trunk sent the
+          // namespaced id, a shortcode, and fromMe:false, so reactions never
+          // appeared on the operator's own messages.
+          const waId = bareWhatsAppMessageId(String(content.messageId));
+          const emoji = toReactionEmoji(String(content.emoji));
+          if (!emoji) {
+            log.warn('Reaction skipped — unknown emoji name', { platformId, emoji: content.emoji });
+            return;
+          }
+          const key = inboundKeyCache.get(waId) ?? { remoteJid: platformId, id: waId, fromMe: false };
           try {
-            await sock.sendMessage(platformId, {
-              react: {
-                text: content.emoji as string,
-                key: { remoteJid: platformId, id: content.messageId as string, fromMe: false },
-              },
-            });
+            await sock.sendMessage(platformId, { react: { text: emoji, key } });
+            log.info('Reaction sent', { platformId, messageId: waId, emoji, fromMe: key.fromMe });
           } catch (err) {
-            log.debug('Failed to send reaction', { platformId, err });
+            log.warn('Failed to send reaction', { platformId, messageId: waId, emoji, err });
           }
           return;
         }
