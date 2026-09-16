@@ -29,6 +29,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { compactResult } from './compact.mjs';
 
 const READ_ONLY_TOOLS = [
   'list_accounts',
@@ -44,6 +45,7 @@ const READ_ONLY_TOOLS = [
 const BRIDGE = process.env.BUSYCAL_BRIDGE;
 const PORT = Number(process.env.BUSYCAL_PORT || 8765);
 const HOST = process.env.BUSYCAL_HOST || '127.0.0.1';
+const TIME_ZONE = process.env.BUSYCAL_TZ || 'Europe/Berlin';
 const ALLOWED = new Set(
   (process.env.BUSYCAL_TOOLS ? process.env.BUSYCAL_TOOLS.split(',') : READ_ONLY_TOOLS).map((t) => t.trim()).filter(Boolean),
 );
@@ -65,9 +67,13 @@ const upstream = new Client({ name: 'nanoclaw-busycal-gateway', version: '1.0.0'
 await upstream.connect(new StdioClientTransport({ command: BRIDGE, args: [], stderr: 'pipe' }));
 const upstreamTools = (await upstream.listTools()).tools;
 
-// Resolve the pinned calendars' titles once, for messages the agent will read.
+// Resolve calendar/account titles once: compaction shows names instead of ids,
+// and the pinned-calendar messages the agent reads use them too.
 const calendarTitles = new Map();
-if (CREATE_CALENDAR_IDS.length > 0) {
+const accountTitles = new Map();
+{
+  const accts = (await upstream.callTool({ name: 'list_accounts', arguments: {} }))?.structuredContent?.result ?? [];
+  for (const a of accts) accountTitles.set(a.id, a.title);
   const res = await upstream.callTool({ name: 'list_calendars', arguments: {} });
   const cals = res?.structuredContent?.result ?? [];
   for (const c of cals) calendarTitles.set(c.calendarID, c.title);
@@ -78,6 +84,7 @@ if (CREATE_CALENDAR_IDS.length > 0) {
   }
 }
 const pinnedLabel = CREATE_CALENDAR_IDS.map((id) => `"${calendarTitles.get(id) ?? id}"`).join(', ');
+const compactCtx = { calendarTitles, accountTitles, timeZone: TIME_ZONE };
 
 const exposed = upstreamTools
   .filter((t) => ALLOWED.has(t.name))
@@ -95,7 +102,7 @@ const exposed = upstreamTools
     };
   });
 const hidden = upstreamTools.filter((t) => !ALLOWED.has(t.name)).map((t) => t.name);
-log('connected to BusyCal bridge', { exposed: exposed.map((t) => t.name), hidden, createCalendars: pinnedLabel || null });
+log('connected to BusyCal bridge', { exposed: exposed.map((t) => t.name), hidden, createCalendars: pinnedLabel || null, timeZone: TIME_ZONE, calendars: calendarTitles.size });
 
 // ── downstream: stateless Streamable HTTP, one Server per request ─────────
 function makeServer() {
@@ -130,7 +137,12 @@ function makeServer() {
     } else {
       log('tool call', { name });
     }
-    return upstream.callTool({ name, arguments: args });
+    const result = await upstream.callTool({ name, arguments: args });
+    const compact = compactResult(name, result, compactCtx);
+    const before = JSON.stringify(result).length;
+    const after = JSON.stringify(compact).length;
+    if (before !== after) log('compacted result', { name, before, after });
+    return compact;
   });
   return server;
 }
