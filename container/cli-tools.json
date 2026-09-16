@@ -8,5 +8,10 @@
     "name": "@anthropic-ai/claude-code",
     "version": "2.1.257",
     "onlyBuilt": true
+  },
+  {
+    "name": "@hoffination/mcp-todoist",
+    "version": "0.2.3",
+    "onlyBuilt": false
   }
 ]

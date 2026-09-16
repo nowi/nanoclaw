@@ -54,12 +54,34 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         ca-certificates \
         curl \
         git \
+        gh \
         tini \
         unzip \
     && if [ "$INSTALL_CJK_FONTS" = "true" ]; then \
         apt-get install -y --no-install-recommends fonts-noto-cjk; \
        fi \
     && rm -rf /var/lib/apt/lists/*
+
+# ---- Local customization (nowi): kubectl + doctl -------------------------------
+# Direct DigitalOcean Kubernetes (DOKS) access for the einkflow dev cluster
+# (see container/skills/dev-api). DOKS kubeconfigs use doctl as their exec
+# credential plugin, so both are needed. Pinned; bump deliberately.
+ARG KUBECTL_VERSION=v1.37.0
+ARG DOCTL_VERSION=1.168.0
+RUN ARCH="$(dpkg --print-architecture)" \
+    && curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl" -o /usr/local/bin/kubectl \
+    && chmod +x /usr/local/bin/kubectl \
+    && curl -fsSL "https://github.com/digitalocean/doctl/releases/download/v${DOCTL_VERSION}/doctl-${DOCTL_VERSION}-linux-${ARCH}.tar.gz" | tar -xz -C /usr/local/bin doctl \
+    && chmod +x /usr/local/bin/doctl
+# Real tokens live in the OneCLI vault and are injected by the gateway; these
+# placeholders only satisfy the CLIs' "is a token configured" checks. The DOKS
+# API server pins its own CA in kubeconfig, so it must bypass the MITM proxy
+# (no credential is injected on that host — kubectl's bearer comes from doctl
+# via api.digitalocean.com, which stays proxied).
+ENV GH_TOKEN=onecli-managed \
+    DIGITALOCEAN_ACCESS_TOKEN=onecli-managed \
+    NO_PROXY=.k8s.ondigitalocean.com \
+    no_proxy=.k8s.ondigitalocean.com
 
 # Chromium path for agent-browser / Playwright consumers
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium

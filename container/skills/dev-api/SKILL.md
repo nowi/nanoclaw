@@ -1,7 +1,7 @@
 ---
 name: dev-api
 description: Query, test, and interact with the einkflow dev server REST API at dev.einkflow.com. Use when asked to call the dev API, check feed items, test adhoc transforms, submit URLs, or interact with the dev backend.
-allowed-tools: Bash(curl:*), Bash(python3:*)
+allowed-tools: Bash(curl:*), Bash(node:*), Bash(doctl:*), Bash(kubectl:*)
 ---
 
 # Dev Server API
@@ -11,26 +11,18 @@ Query the einkflow dev server REST API.
 ## Connection Details
 
 - **Base URL**: `https://dev.einkflow.com`
-- **Auth**: Personal Access Token (PAT) via Bearer header
-- **Token source**: `$EINKFLOW_PAT` env var (injected by NanoClaw via `allowedSecrets`); falls back to `~/.einkflow-pat-token` for local/host use
+- **Auth**: Personal Access Token (PAT) as a Bearer header — **injected automatically by the OneCLI gateway**. Your HTTPS traffic is proxied; requests to `dev.einkflow.com` get the real `Authorization` header at the proxy. You never see or handle the token, and there is no `$EINKFLOW_PAT` env var or token file in the container.
 
 ## Usage
 
-### Step 1: Read the PAT
+Call the API directly. Do not add an `Authorization` header yourself and do not look for a token:
 
 ```bash
-TOKEN="${EINKFLOW_PAT:-$(cat ~/.einkflow-pat-token 2>/dev/null)}"
+curl -s "https://dev.einkflow.com/api/v1/<endpoint>" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.stringify(JSON.parse(s),null,2)))'
 ```
 
-### Step 2: Use the token for API requests
+**Important:** PAT tokens do not expire (unless revoked by the user). No refresh flow is needed. If a request returns 401 or a gateway error (`app_not_connected`, `secret_not_found`), the PAT in the OneCLI vault may have been revoked or removed — tell the user; do not ask them to paste a token into chat.
 
-```bash
-curl -s -H "Authorization: Bearer $TOKEN" "https://dev.einkflow.com/api/v1/<endpoint>" | python3 -m json.tool
-```
-
-**Important:** PAT tokens do not expire (unless revoked by the user). No refresh flow is needed. Inside a NanoClaw container, the token arrives as `$EINKFLOW_PAT` (must be listed in the group's `allowedSecrets`). On the host, the file at `~/.einkflow-pat-token` is the fallback. If a request returns 401, the token may have been revoked — ask the user to provide a new PAT.
-
-No port-forward is needed — the API is publicly accessible via the Kubernetes ingress at `dev.einkflow.com`.
 
 ## Auth Endpoints — `/api/v1/auth`
 - `POST /api/v1/auth/login` — Login (body: `{email, password}`) -> `{accessToken, refreshToken, expiresIn, userId, email, role}`
@@ -165,8 +157,11 @@ The dev backend runs on a **DigitalOcean Kubernetes (DOKS)** cluster. For pod-le
 operations (logs, restarts, describing resources) you can talk to the cluster directly
 instead of going through the REST API.
 
-**Auth:** `doctl` reads `$DIGITALOCEAN_ACCESS_TOKEN`, injected by NanoClaw via the group's
-`allowedSecrets`. No `doctl auth init` is needed. The token is scoped to Kubernetes only.
+**Auth:** the DigitalOcean token lives in the OneCLI vault and is injected by the gateway on
+calls to `api.digitalocean.com`. The container ships with a placeholder
+`DIGITALOCEAN_ACCESS_TOKEN` already set (the gateway swaps in the real one) and the DOKS API
+server excluded from the proxy, so `doctl` and `kubectl` work as-is — no `doctl auth init`.
+The real token is scoped to Kubernetes only.
 
 The container home directory is ephemeral, so generate the kubeconfig once at the start of
 each container session, then use `kubectl` normally:
