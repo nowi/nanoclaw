@@ -5,7 +5,7 @@ class StatusBarController: NSObject {
     private var isRunning = false
     private var timer: Timer?
 
-    private let plistPath = "\(NSHomeDirectory())/Library/LaunchAgents/com.nanoclaw-v2-ee0df269.plist"
+    private let plistPath = "\(NSHomeDirectory())/Library/LaunchAgents/com.nanoclaw-v2-43655158.plist"
 
     /// Derive the NanoClaw project root from the binary location.
     /// The binary is compiled to {project}/dist/statusbar, so the parent of
@@ -47,7 +47,7 @@ class StatusBarController: NSObject {
     private func checkRunning() -> Bool {
         let task = Process()
         task.launchPath = "/bin/launchctl"
-        task.arguments = ["list", "com.nanoclaw-v2-ee0df269"]
+        task.arguments = ["list", "com.nanoclaw-v2-43655158"]
         let pipe = Pipe()
         task.standardOutput = pipe
         task.standardError = Pipe()
@@ -111,7 +111,7 @@ class StatusBarController: NSObject {
 
     @objc private func restartService() {
         let uid = getuid()
-        run("/bin/launchctl", ["kickstart", "-k", "gui/\(uid)/com.nanoclaw-v2-ee0df269"])
+        run("/bin/launchctl", ["kickstart", "-k", "gui/\(uid)/com.nanoclaw-v2-43655158"])
         refresh(after: 3)
     }
 
