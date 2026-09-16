@@ -17,6 +17,11 @@
  *   BUSYCAL_BRIDGE   path to BusyCalMCPBridge (required)
  *   BUSYCAL_PORT     default 8765          BUSYCAL_HOST  default 127.0.0.1
  *   BUSYCAL_TOOLS    comma-separated allowlist; default = the read-only set
+ *   BUSYCAL_CREATE_CALENDAR_IDS
+ *                    comma-separated BusyCal calendarIDs. When set, `create_event`
+ *                    is exposed too, but every call is pinned to these calendars:
+ *                    a missing calendarID becomes the first one, any other id is
+ *                    refused. Nothing else becomes writable.
  */
 import http from 'node:http';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -42,6 +47,11 @@ const HOST = process.env.BUSYCAL_HOST || '127.0.0.1';
 const ALLOWED = new Set(
   (process.env.BUSYCAL_TOOLS ? process.env.BUSYCAL_TOOLS.split(',') : READ_ONLY_TOOLS).map((t) => t.trim()).filter(Boolean),
 );
+const CREATE_CALENDAR_IDS = (process.env.BUSYCAL_CREATE_CALENDAR_IDS || '')
+  .split(',')
+  .map((t) => t.trim())
+  .filter(Boolean);
+if (CREATE_CALENDAR_IDS.length > 0) ALLOWED.add('create_event');
 
 if (!BRIDGE) {
   console.error('BUSYCAL_BRIDGE is required');
@@ -54,9 +64,38 @@ const log = (msg, extra) => console.log(`[${new Date().toISOString()}] ${msg}${e
 const upstream = new Client({ name: 'nanoclaw-busycal-gateway', version: '1.0.0' });
 await upstream.connect(new StdioClientTransport({ command: BRIDGE, args: [], stderr: 'pipe' }));
 const upstreamTools = (await upstream.listTools()).tools;
-const exposed = upstreamTools.filter((t) => ALLOWED.has(t.name));
+
+// Resolve the pinned calendars' titles once, for messages the agent will read.
+const calendarTitles = new Map();
+if (CREATE_CALENDAR_IDS.length > 0) {
+  const res = await upstream.callTool({ name: 'list_calendars', arguments: {} });
+  const cals = res?.structuredContent?.result ?? [];
+  for (const c of cals) calendarTitles.set(c.calendarID, c.title);
+  for (const id of CREATE_CALENDAR_IDS) {
+    const c = cals.find((x) => x.calendarID === id);
+    if (!c) log('WARNING: pinned calendar id not found in BusyCal', { id });
+    else if (!c.isWritable) log('WARNING: pinned calendar is not writable', { id, title: c.title });
+  }
+}
+const pinnedLabel = CREATE_CALENDAR_IDS.map((id) => `"${calendarTitles.get(id) ?? id}"`).join(', ');
+
+const exposed = upstreamTools
+  .filter((t) => ALLOWED.has(t.name))
+  .map((t) => {
+    if (t.name !== 'create_event' || CREATE_CALENDAR_IDS.length === 0) return t;
+    // Tell the agent the rule up front, and remove the illusion of choice.
+    const schema = structuredClone(t.inputSchema ?? {});
+    if (schema.properties?.calendarID) {
+      schema.properties.calendarID.description = `Optional. Only the pinned calendar(s) ${pinnedLabel} are permitted; omit to use ${pinnedLabel.split(', ')[0]}. Any other calendar is refused.`;
+    }
+    return {
+      ...t,
+      description: `${t.description ?? ''} RESTRICTED: events are always created in the calendar ${pinnedLabel} (the operator's private calendar); other calendars are refused by the gateway.`.trim(),
+      inputSchema: schema,
+    };
+  });
 const hidden = upstreamTools.filter((t) => !ALLOWED.has(t.name)).map((t) => t.name);
-log('connected to BusyCal bridge', { exposed: exposed.map((t) => t.name), hidden });
+log('connected to BusyCal bridge', { exposed: exposed.map((t) => t.name), hidden, createCalendars: pinnedLabel || null });
 
 // ── downstream: stateless Streamable HTTP, one Server per request ─────────
 function makeServer() {
@@ -71,8 +110,27 @@ function makeServer() {
         content: [{ type: 'text', text: `Tool '${name}' is not available: this calendar connection is read-only.` }],
       };
     }
-    log('tool call', { name });
-    return upstream.callTool({ name, arguments: req.params.arguments ?? {} });
+    const args = { ...(req.params.arguments ?? {}) };
+    if (name === 'create_event') {
+      const requested = typeof args.calendarID === 'string' && args.calendarID.trim() ? args.calendarID.trim() : null;
+      if (requested && !CREATE_CALENDAR_IDS.includes(requested)) {
+        log('refused create_event — calendar not permitted', { requested, title: calendarTitles.get(requested) ?? null });
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text',
+              text: `Refused: events may only be created in ${pinnedLabel}. Calendar '${calendarTitles.get(requested) ?? requested}' is not permitted. Omit calendarID to use the permitted calendar.`,
+            },
+          ],
+        };
+      }
+      args.calendarID = requested ?? CREATE_CALENDAR_IDS[0];
+      log('create_event', { title: args.title, startDate: args.startDate, calendar: calendarTitles.get(args.calendarID) ?? args.calendarID });
+    } else {
+      log('tool call', { name });
+    }
+    return upstream.callTool({ name, arguments: args });
   });
   return server;
 }
