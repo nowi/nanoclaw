@@ -45,6 +45,7 @@ import { log } from '../log.js';
 import { transcribeVoiceNote, withVoiceTranscript } from '../transcription.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import { InboundKeyCache, bareWhatsAppMessageId, toReactionEmoji } from './whatsapp-reactions.js';
+import { assistantNameFor, hasAssistantPrefix, parseAssistantNameByChat } from './whatsapp-names.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
 import type {
   ChannelAdapter,
@@ -402,8 +403,10 @@ export function computeWhatsappDefaults(shared: boolean): ChannelDefaults {
 // Adapter-internal env: same .env keys as always (setup/channels/whatsapp.ts
 // still writes them), but read here instead of imported from core config —
 // shared-number handling is channel-local.
-const waEnv = readEnvFile(['ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER']);
+const waEnv = readEnvFile(['ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER', 'ASSISTANT_NAME_BY_CHAT']);
 const ASSISTANT_NAME = waEnv.ASSISTANT_NAME || 'Andy';
+// Local customization (nowi): per-chat names, see whatsapp-names.ts.
+const ASSISTANT_NAME_BY_CHAT = parseAssistantNameByChat(waEnv.ASSISTANT_NAME_BY_CHAT);
 const WHATSAPP_SHARED = resolveSharedMode(waEnv.ASSISTANT_HAS_OWN_NUMBER);
 const WHATSAPP_DEFAULTS: ChannelDefaults = computeWhatsappDefaults(WHATSAPP_SHARED);
 
@@ -908,12 +911,14 @@ registerChannelAdapter('whatsapp', {
               // Bot echoes: sent-cache first, then the shared-mode name
               // prefix as a fallback for sends the cache has evicted.
               if (sentMessageCache.has(msg.key.id || '')) continue;
-              if (WHATSAPP_SHARED && content.startsWith(`${ASSISTANT_NAME}:`)) continue;
+              if (WHATSAPP_SHARED && hasAssistantPrefix(content, ASSISTANT_NAME_BY_CHAT, ASSISTANT_NAME)) continue;
             }
 
             inboundKeyCache.remember(msg.key);
 
-            const isBotMessage = WHATSAPP_SHARED ? content.startsWith(`${ASSISTANT_NAME}:`) : false;
+            const isBotMessage = WHATSAPP_SHARED
+              ? hasAssistantPrefix(content, ASSISTANT_NAME_BY_CHAT, ASSISTANT_NAME)
+              : false;
 
             // Check if this reply answers a pending question via slash command
             const pending = pendingQuestions.get(chatJid);
@@ -1103,7 +1108,9 @@ registerChannelAdapter('whatsapp', {
 
         if (text) {
           const { text: formatted, mentions } = formatWhatsApp(text);
-          const prefixed = WHATSAPP_SHARED ? `${ASSISTANT_NAME}: ${formatted}` : formatted;
+          const prefixed = WHATSAPP_SHARED
+            ? `${assistantNameFor(platformId, ASSISTANT_NAME_BY_CHAT, ASSISTANT_NAME)}: ${formatted}`
+            : formatted;
           return sendRawMessage(platformId, prefixed, mentions);
         }
       },
