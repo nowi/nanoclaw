@@ -71,12 +71,17 @@ const upstreamTools = (await upstream.listTools()).tools;
 // and the pinned-calendar messages the agent reads use them too.
 const calendarTitles = new Map();
 const accountTitles = new Map();
+const calendarAccounts = new Map(); // calendarID → account title
 {
   const accts = (await upstream.callTool({ name: 'list_accounts', arguments: {} }))?.structuredContent?.result ?? [];
   for (const a of accts) accountTitles.set(a.id, a.title);
   const res = await upstream.callTool({ name: 'list_calendars', arguments: {} });
   const cals = res?.structuredContent?.result ?? [];
-  for (const c of cals) calendarTitles.set(c.calendarID, c.title);
+  for (const c of cals) {
+    calendarTitles.set(c.calendarID, c.title);
+    const acct = accountTitles.get(c.accountID);
+    if (acct) calendarAccounts.set(c.calendarID, acct);
+  }
   for (const id of CREATE_CALENDAR_IDS) {
     const c = cals.find((x) => x.calendarID === id);
     if (!c) log('WARNING: pinned calendar id not found in BusyCal', { id });
@@ -84,7 +89,7 @@ const accountTitles = new Map();
   }
 }
 const pinnedLabel = CREATE_CALENDAR_IDS.map((id) => `"${calendarTitles.get(id) ?? id}"`).join(', ');
-const compactCtx = { calendarTitles, accountTitles, timeZone: TIME_ZONE };
+const compactCtx = { calendarTitles, accountTitles, calendarAccounts, timeZone: TIME_ZONE };
 
 const exposed = upstreamTools
   .filter((t) => ALLOWED.has(t.name))
