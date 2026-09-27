@@ -56,3 +56,7 @@ docs/maintainer-guide.md
 docs/drafts/
 forks.md
 .worktrees/
+
+# buchbox CLI (added by /add-buchbox)
+scripts/buchbox/.venv/
+scripts/buchbox/__pycache__/
