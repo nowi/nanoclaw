@@ -123,3 +123,31 @@ export function toReactionEmoji(input: string): string | null {
   const name = raw.replace(/^:|:$/g, '').toLowerCase();
   return SHORTCODES[name] ?? null;
 }
+
+/**
+ * Strip variation selectors and skin-tone modifiers so 👍🏽 and 👍️ both read as
+ * a plain 👍.
+ */
+export function baseEmoji(input: string): string {
+  // Alternation, not one character class: a class mixing emoji modifiers with
+  // other codepoints trips no-misleading-character-class.
+  return (input || '').replace(/\u{FE0E}|\u{FE0F}|\u{200D}|[\u{1F3FB}-\u{1F3FF}]/gu, '').trim();
+}
+
+/**
+ * The option VALUE a reaction answers on a question card, or null.
+ *
+ * Deliberately narrow: only the two values the shared approval card uses. A
+ * generic ask_user_question with options like "Yes"/"No" is left alone rather
+ * than guessed at — a wrong guess would resolve somebody's question for them.
+ */
+export function reactionToOptionValue(emoji: string): 'approve' | 'reject' | null {
+  switch (baseEmoji(emoji)) {
+    case '\u{1F44D}':
+      return 'approve';
+    case '\u{1F44E}':
+      return 'reject';
+    default:
+      return null;
+  }
+}
