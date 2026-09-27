@@ -110,6 +110,13 @@ const GROUP_METADATA_CACHE_TTL_MS = 60_000; // 1 min for outbound sends
 const SENT_MESSAGE_CACHE_MAX = 256;
 const RECONNECT_DELAY_MS = 5000;
 const PENDING_QUESTIONS_MAX = 64;
+/**
+ * Cap on inbound media bytes we inline for inbox staging (mirrors the iMessage
+ * adapter's cap). Above it the bytes stay in the host archive only and the
+ * agent gets a note instead of a file. Override with
+ * WHATSAPP_MAX_INLINE_ATTACHMENT_BYTES.
+ */
+const DEFAULT_MAX_INLINE_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 
 /** Normalize an option label to a slash command: "Approve" → "/approve" */
 function optionToCommand(option: string): string {
@@ -338,9 +345,65 @@ export function rewriteBotLidMention(
  * empty-message guard. Returns `content` unchanged when nothing failed.
  */
 export function appendMediaFailureNote(content: string, failures: string[]): string {
-  if (failures.length === 0) return content;
-  const note = failures.map((t) => `[${t} could not be downloaded]`).join(' ');
+  return appendMediaNotes(
+    content,
+    failures.map((t) => `[${t} could not be downloaded]`),
+  );
+}
+
+/**
+ * Append pre-rendered media notes to the message text. Used for media we
+ * fetched but deliberately did not hand to the agent (over the inline cap) —
+ * silence there would look like the attachment was never sent.
+ */
+export function appendMediaNotes(content: string, notes: string[]): string {
+  if (notes.length === 0) return content;
+  const note = notes.join(' ');
   return content ? `${content}\n${note}` : note;
+}
+
+/** One inbound attachment as the host expects it: bytes, never a path. */
+export interface InboundAttachment {
+  type: string;
+  name: string;
+  mimeType?: string;
+  size: number;
+  /** base64. Absent when the media is over the inline cap. */
+  data?: string;
+}
+
+/**
+ * Build the attachment entry the host stages into the session inbox.
+ *
+ * Deliberately emits NO `localPath`: the host owns that field and sets it to a
+ * session-relative `inbox/<messageId>/<file>` path while staging the bytes
+ * (`extractAttachmentFiles` in session-manager). An adapter-supplied
+ * `localPath` would name a host directory that is not mounted into the
+ * container, so the agent would be handed `/workspace/<that>` and find nothing
+ * there — which is exactly how inbound images used to go missing.
+ *
+ * Over the cap we return the entry without `data` plus a note: the agent is
+ * told media arrived and why it cannot open it, rather than being given a
+ * path that does not resolve.
+ */
+export function buildInboundAttachment(
+  type: string,
+  filename: string,
+  mimeType: string | undefined,
+  buffer: Buffer,
+  cap: number,
+): { entry: InboundAttachment; note?: string } {
+  const entry: InboundAttachment = {
+    type,
+    name: filename,
+    ...(mimeType ? { mimeType } : {}),
+    size: buffer.length,
+  };
+  if (buffer.length > cap) {
+    return { entry, note: `[${type} ${filename} too large to attach (${Math.round(buffer.length / 1024)} KB)]` };
+  }
+  entry.data = buffer.toString('base64');
+  return { entry };
 }
 
 /** Map file extension to Baileys media message type. */
@@ -403,12 +466,20 @@ export function computeWhatsappDefaults(shared: boolean): ChannelDefaults {
 // Adapter-internal env: same .env keys as always (setup/channels/whatsapp.ts
 // still writes them), but read here instead of imported from core config —
 // shared-number handling is channel-local.
-const waEnv = readEnvFile(['ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER', 'ASSISTANT_NAME_BY_CHAT']);
+const waEnv = readEnvFile([
+  'ASSISTANT_NAME',
+  'ASSISTANT_HAS_OWN_NUMBER',
+  'ASSISTANT_NAME_BY_CHAT',
+  'WHATSAPP_MAX_INLINE_ATTACHMENT_BYTES',
+]);
 const ASSISTANT_NAME = waEnv.ASSISTANT_NAME || 'Andy';
 // Local customization (nowi): per-chat names, see whatsapp-names.ts.
 const ASSISTANT_NAME_BY_CHAT = parseAssistantNameByChat(waEnv.ASSISTANT_NAME_BY_CHAT);
 const WHATSAPP_SHARED = resolveSharedMode(waEnv.ASSISTANT_HAS_OWN_NUMBER);
 const WHATSAPP_DEFAULTS: ChannelDefaults = computeWhatsappDefaults(WHATSAPP_SHARED);
+const maxInlineBytes =
+  Number(process.env.WHATSAPP_MAX_INLINE_ATTACHMENT_BYTES || waEnv.WHATSAPP_MAX_INLINE_ATTACHMENT_BYTES) ||
+  DEFAULT_MAX_INLINE_ATTACHMENT_BYTES;
 
 registerChannelAdapter('whatsapp', {
   factory: () => {
@@ -575,14 +646,35 @@ registerChannelAdapter('whatsapp', {
       }
     }
 
-    /** Download media from an inbound message, save to /workspace/attachments/. */
+    /**
+     * Download media from an inbound message.
+     *
+     * The bytes have two consumers with two different views of the filesystem,
+     * so they are returned two ways:
+     *
+     *  - `hostPaths` (filename → absolute path under `DATA_DIR/attachments/`) —
+     *    the host-side archive. Voice-note transcription runs here on the host
+     *    with whisper.cpp and needs a real file. The container never sees this
+     *    tree: it is not mounted, by design.
+     *  - the attachment entry's base64 `data` — the host stages this into the
+     *    session's inbox (`extractAttachmentFiles` in session-manager) and
+     *    rewrites the entry to a `localPath` under `/workspace`, the only tree
+     *    the container can read.
+     *
+     * Emitting a `localPath` from here is what broke image reading: it named a
+     * host path (`attachments/<file>`) that the formatter turned into
+     * `/workspace/attachments/<file>`, which does not exist inside the
+     * container. The host owns `localPath`; an adapter passes bytes.
+     */
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     async function downloadInboundMedia(
       msg: WAMessage,
       normalized: any,
     ): Promise<{
-      attachments: Array<{ type: string; name: string; localPath: string }>;
+      attachments: InboundAttachment[];
       failures: string[];
+      notes: string[];
+      hostPaths: Map<string, string>;
     }> {
       const mediaTypes: Array<{ key: string; type: string; ext: string }> = [
         { key: 'imageMessage', type: 'image', ext: '.jpg' },
@@ -590,8 +682,10 @@ registerChannelAdapter('whatsapp', {
         { key: 'audioMessage', type: 'audio', ext: '.ogg' },
         { key: 'documentMessage', type: 'document', ext: '' },
       ];
-      const results: Array<{ type: string; name: string; localPath: string }> = [];
+      const results: InboundAttachment[] = [];
       const failures: string[] = [];
+      const notes: string[] = [];
+      const hostPaths = new Map<string, string>();
       for (const { key, type, ext } of mediaTypes) {
         if (!normalized[key]) continue;
         try {
@@ -621,14 +715,27 @@ registerChannelAdapter('whatsapp', {
           fs.mkdirSync(attachDir, { recursive: true });
           const filePath = path.join(attachDir, filename);
           fs.writeFileSync(filePath, buffer);
-          results.push({ type, name: filename, localPath: `attachments/${filename}` });
-          log.info('Media downloaded', { type, filename });
+          hostPaths.set(filename, filePath);
+          const mimeType = typeof normalized[key].mimetype === 'string' ? normalized[key].mimetype : undefined;
+          const { entry, note } = buildInboundAttachment(type, filename, mimeType, buffer, maxInlineBytes);
+          if (note) {
+            // Over the cap: the archive keeps the bytes, the agent gets the note.
+            notes.push(note);
+            log.warn('Inbound media over inline cap, not staged for the agent', {
+              type,
+              filename,
+              size: buffer.length,
+              cap: maxInlineBytes,
+            });
+          }
+          results.push(entry);
+          log.info('Media downloaded', { type, filename, size: buffer.length, staged: entry.data !== undefined });
         } catch (err) {
           log.warn('Failed to download media', { type, err });
           failures.push(type);
         }
       }
-      return { attachments: results, failures };
+      return { attachments: results, failures, notes, hostPaths };
     }
 
     async function sendRawMessage(jid: string, text: string, mentions?: string[]): Promise<string | undefined> {
@@ -864,19 +971,21 @@ registerChannelAdapter('whatsapp', {
             content = rewriteBotLidMention(content, WHATSAPP_SHARED, botLidUser, ASSISTANT_NAME);
 
             // Download media attachments (images, video, audio, documents)
-            const { attachments, failures } = await downloadInboundMedia(msg, normalized);
+            const { attachments, failures, notes, hostPaths } = await downloadInboundMedia(msg, normalized);
 
             // Surface failed downloads as text so the agent knows media was
             // sent even when it couldn't be fetched — instead of silently
             // dropping the attachment (or the whole message, if uncaptioned).
             content = appendMediaFailureNote(content, failures);
+            content = appendMediaNotes(content, notes);
 
             // Local customization (v1 parity, nowi): voice notes are
             // transcribed on the host with whisper.cpp and delivered as
             // `[Voice: …]` text — the agent can't listen to the .ogg.
             if (normalized.audioMessage?.ptt === true) {
               const audio = attachments.find((a) => a.type === 'audio');
-              const transcript = audio ? await transcribeVoiceNote(path.join(DATA_DIR, audio.localPath)) : null;
+              const audioPath = audio ? hostPaths.get(audio.name) : undefined;
+              const transcript = audioPath ? await transcribeVoiceNote(audioPath) : null;
               content = withVoiceTranscript(content, transcript);
               log.info('Voice note processed', {
                 chatJid,
