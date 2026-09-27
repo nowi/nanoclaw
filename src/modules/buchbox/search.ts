@@ -115,6 +115,11 @@ export async function handleBuchboxSearch(content: Record<string, unknown>, sess
       binding: clamp(book.binding),
       price: book.price_text || (book.price !== null ? `${book.price} EUR` : ''),
       availability: clamp(book.availability),
+      // The agent must be able to say "erscheint am …" and must not offer a
+      // pickup order for something the shop will not hold.
+      preorder: book.is_preorder === true,
+      publication_date: book.published ?? '',
+      pickup_available: book.pickup_available !== false,
       url: book.url,
     }));
     log.info('buchbox_search served', { requestId, hits: data.length, sessionId: session.id });

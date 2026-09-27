@@ -22,18 +22,22 @@ from urllib.parse import parse_qs
 HERE = Path(__file__).resolve().parent
 SCRIPT = HERE / "buchbox.py"
 EAN = "9783897948228"
+PREORDER_EAN = "9783963311130"
 
 DETAIL_HTML = f"""<!DOCTYPE html><html><body>
+<div id="bonuswebshop-search-detail-add-to-cart">
 <div id="bonuswebshop-search-detail">
   <div class="image-media-box"><span title=" - Englische Broschur"></span></div>
   <h1>TRESCHER Reiseführer Sansibar</h1>
   <div id="bonuswebshop-search-detail-info-autor">Chengula, Francisca</div>
   <div id="bonuswebshop-search-detail-info-verlag">Trescher Verlag GmbH</div>
 </div>
+<div class="shop-item-reverse"><a href="/reserve/nojs/{EAN}" class="btn btn-default btn-reserve use-ajax">Abholbestellung</a></div>
 <div id="bonuswebshop-search-detail-add-to-cart-content">19,95 €
   <meta itemprop="price" content="19.95">
   <meta itemprop="gtin13" content="{EAN}">
   <link itemprop="availability" href="http://schema.org/InStock"/>
+</div>
 </div>
 <p class="bonuswebshop-search-detail-availability-text">In 1-2 Werktagen im Laden</p>
 </body></html>"""
@@ -65,6 +69,28 @@ RESERVE_FORM_TMPL = f"""<form action="/reserve/nojs/{EAN}" method="post" id="bon
 RESERVE_FORM = RESERVE_FORM_TMPL.format(stores=STORE_RADIOS)
 RESERVE_FORM_NO_STORES = RESERVE_FORM_TMPL.format(stores="")
 
+# A pre-order as the shop really renders it: the Abholbestellung anchor is
+# HTML-commented out, the date field says "Erscheint am", and schema.org
+# availability still claims InStock — which is why that field must be ignored.
+PREORDER_HTML = f"""<!DOCTYPE html><html><body>
+<div id="bonuswebshop-search-detail">
+  <h1>DSA5 Einsteigerbox</h1>
+  <div id="bonuswebshop-search-detail-info-erscheinungsDatum">Erscheint am 15.10.2026</div>
+</div>
+<div id="bonuswebshop-search-detail-add-to-cart">
+  <div id="bonuswebshop-search-detail-add-to-cart-content">39,95 €
+    <meta itemprop="price" content="39.95">
+    <meta itemprop="gtin13" content="{PREORDER_EAN}">
+    <link itemprop="availability" href="http://schema.org/InStock"/>
+  </div>
+  <!--<div class="shop-item-reverse">
+  <a href="#" class="btn btn-default btn-reserve disabled">Abholbestellung</a>
+  </div>-->
+  <a class="use-ajax bonuswebshopframe-add-to-cart btn btn-primary" href="/cart/add/nojs/{PREORDER_EAN}">In den Warenkorb</a>
+</div>
+<p class="bonuswebshop-search-detail-availability-text">Nicht lieferbar</p>
+</body></html>"""
+
 
 def ctools(output: str) -> bytes:
     return json.dumps([
@@ -91,6 +117,8 @@ class Stub(BaseHTTPRequestHandler):
         if Stub.mode == "captcha":
             return self._send(b"<html><body><div class='g-recaptcha'></div></body></html>")
         if self.path.startswith("/shop/item/"):
+            if PREORDER_EAN in self.path:
+                return self._send(PREORDER_HTML.encode("utf-8"))
             return self._send(DETAIL_HTML.encode("utf-8"))
         if self.path.startswith("/reserve/nojs/"):
             if Stub.mode == "no_stores":
@@ -208,6 +236,34 @@ class BuchboxCliTest(unittest.TestCase):
         self.assertIn("nicht zur Abholung", r.stderr)
         self.assertNotIn("Keine Filiale enth", r.stderr)
         self.assertEqual(Stub.last_post, {})
+
+    def test_preorder_is_refused_with_its_publication_date(self):
+        Stub.mode, Stub.last_post = "success", {}
+        r = self.run_cli("order", PREORDER_EAN)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("15.10.2026", r.stderr)
+        self.assertIn("keine Abholbestellung", r.stderr)
+        # Refused from the article page, so the reserve form is never fetched.
+        self.assertEqual(Stub.last_post, {})
+
+    def test_preorder_flags_surface_in_json(self):
+        Stub.mode = "success"
+        r = self.run_cli("--json", "show", PREORDER_EAN)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        book = json.loads(r.stdout)
+        self.assertTrue(book["is_preorder"])
+        self.assertFalse(book["pickup_available"])
+        self.assertEqual(book["published"], "15.10.2026")
+        # schema.org says InStock for a title months away — must not be trusted.
+        self.assertEqual(book["availability_schema"], "InStock")
+        self.assertEqual(book["availability"], "Nicht lieferbar")
+
+    def test_published_title_is_pickupable(self):
+        Stub.mode = "success"
+        r = self.run_cli("--json", "show", EAN)
+        book = json.loads(r.stdout)
+        self.assertFalse(book["is_preorder"])
+        self.assertTrue(book["pickup_available"])
 
     def test_captcha_aborts(self):
         Stub.mode = "captcha"

@@ -74,7 +74,7 @@ export const buchboxSearch: McpToolDefinition = {
   tool: {
     name: 'buchbox_search',
     description:
-      'Search the BUCHBOX! Berlin catalogue. Read-only and needs no approval. Give a free-text `query` (title/keyword), or `author`, or `publisher`, or an exact `isbn`. An exact ISBN returns one fully-populated hit including availability; a keyword search returns a list WITHOUT availability (the shop omits it there) — pass `availability: true` to fetch it per hit, which costs one extra request each, so keep `limit` small. Use this to find a book and its ISBN, then pass that ISBN to buchbox_order.',
+      'Search the BUCHBOX! Berlin catalogue. Read-only and needs no approval. Give a free-text `query` (title/keyword), or `author`, or `publisher`, or an exact `isbn`. An exact ISBN returns one fully-populated hit including availability; a keyword search returns a list WITHOUT availability (the shop omits it there) — pass `availability: true` to fetch it per hit, which costs one extra request each, so keep `limit` small. Each hit carries `preorder`, `publication_date` and `pickup_available`: when `preorder` is true the title is not out yet, so TELL THE USER the publication_date and do NOT call buchbox_order — the shop offers no pickup until it is published. Otherwise use this to find a book and its ISBN, then pass that ISBN to buchbox_order.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -132,7 +132,7 @@ export const buchboxOrder: McpToolDefinition = {
   tool: {
     name: 'buchbox_order',
     description:
-      'Order a book at BUCHBOX! Berlin for PICKUP (never shipping). Identity defaults to the operator configured on the host, so normally pass only `isbn`. Pass first_name/last_name/email/phone ONLY when ordering for somebody else — never invent values; ask if unsure. Requires admin approval and is fire-and-forget: you will be notified once the order is placed or refused. Payment happens in the shop, so no payment details are involved.',
+      'Order a book at BUCHBOX! Berlin for PICKUP (never shipping). Only works for titles that are already published — a pre-order (buchbox_search reports `preorder: true`) has no pickup option and will be refused with its publication date. Identity defaults to the operator configured on the host, so normally pass only `isbn`. Pass first_name/last_name/email/phone ONLY when ordering for somebody else — never invent values; ask if unsure. Requires admin approval and is fire-and-forget: you will be notified once the order is placed or refused. Payment happens in the shop, so no payment details are involved.',
     inputSchema: {
       type: 'object' as const,
       properties: {

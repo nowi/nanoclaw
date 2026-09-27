@@ -310,6 +310,19 @@ class Book:
     availability: str = ""
     availability_schema: str = ""
     url: str = ""
+    #: True when the shop says "Erscheint am <date>" — not published yet.
+    is_preorder: bool = False
+    #: False when the shop offers no Abholbestellung for this article.
+    pickup_available: bool = True
+
+    @property
+    def release_note(self) -> str:
+        """One human line about publication state, or empty."""
+        if self.is_preorder and self.published:
+            return f"Vorbestellung — erscheint am {self.published}"
+        if self.is_preorder:
+            return "Vorbestellung — Erscheinungsdatum unbekannt"
+        return ""
 
     @property
     def price_display(self) -> str:
@@ -337,7 +350,15 @@ def parse_detail(html: str, url: str = "") -> Book:
     book.publisher = _text(root.find(id="bonuswebshop-search-detail-info-verlag"))
     book.category = _text(root.find(id="bonuswebshop-search-detail-info-wg"))
     published = _text(root.find(id="bonuswebshop-search-detail-info-erscheinungsDatum"))
-    book.published = re.sub(r"^Erschienen am\s*", "", published).strip()
+    # "Erscheint am <date>" = not out yet; "Erschienen am <date>" = published.
+    book.is_preorder = published.startswith("Erscheint")
+    book.published = re.sub(r"^(?:Erschienen|Erscheint)\s+am\s*", "", published).strip()
+    # The shop comments the Abholbestellung button out for articles it will not
+    # hold for pickup (unpublished titles, e-books). An absent anchor is the
+    # authoritative signal — note that schema.org availability reports InStock
+    # even for a title that is months away, so it must NOT be used here.
+    action = soup.find(id="bonuswebshop-search-detail-add-to-cart") or soup
+    book.pickup_available = action.select_one("a.btn-reserve") is not None
 
     icon = root.select_one(".image-media-box span[title]")
     if icon:
@@ -378,6 +399,7 @@ def parse_result_tiles(html: str, base_url: str) -> tuple[list[Book], int | None
         book.title = _text(tile.select_one(".info-container .title"))
         book.author = _text(tile.select_one(".autor"))
         book.price, book.price_text = parse_price(_text(tile.select_one(".price")))
+        book.pickup_available = tile.select_one("a.btn-reserve") is not None
         icon = tile.select_one(".bonuswebshop-search-result-icon span[title]")
         if icon:
             book.binding = re.sub(r"^\s*-\s*", "", icon.get("title") or "").strip()
@@ -559,6 +581,10 @@ def do_search(client: Client, args) -> int:
         if book.binding:
             row("Ausführung", book.binding)
         row("Verfügbarkeit", book.availability or "— (mit --availability abrufen)")
+        if book.release_note:
+            row("Hinweis", book.release_note)
+        elif not book.pickup_available:
+            row("Hinweis", "keine Abholbestellung möglich")
         row("URL", book.url)
     if any(not b.availability for b in shown):
         print("\nHinweis: Verfügbarkeit steht nur auf der Artikelseite. "
@@ -577,9 +603,13 @@ def do_show(client: Client, args) -> int:
     print()
     for label, value in (
         ("Autor", book.author), ("Verlag", book.publisher), ("Kategorie", book.category),
-        ("Erschienen", book.published), ("Ausführung", book.binding),
+        ("Erscheint am" if book.is_preorder else "Erschienen", book.published),
+        ("Ausführung", book.binding),
         ("ISBN/EAN", book.ean), ("Preis", book.price_display),
-        ("Verfügbarkeit", book.availability), ("URL", book.url),
+        ("Verfügbarkeit", book.availability),
+        ("Vorbestellung", book.release_note),
+        ("Abholung", "" if book.pickup_available else "vom Shop nicht angeboten"),
+        ("URL", book.url),
     ):
         if value:
             print(f"  {label + ':':<15} {value}")
@@ -614,6 +644,8 @@ def print_order_summary(book: Book, store: Store, who: Identity) -> None:
     print(f"  Preis:         {book.price_display}  (inkl. MwSt.)")
     print(f"  Menge:         1")
     print(f"  Verfügbarkeit: {book.availability or 'unbekannt'}")
+    if book.release_note:
+        print(f"  Hinweis:       {book.release_note}")
     print(line)
     print(f"  Lieferart:     Abholung (kein Versand)")
     print(f"  Filiale:       {store.label}  [store={store.store_id}]")
@@ -637,6 +669,20 @@ def do_order(client: Client, args, cfg: dict[str, str]) -> int:
         return 2
 
     book = fetch_detail(client, ean)
+    if not book.pickup_available:
+        # Caught from the article page, so this costs no extra request. The
+        # reserve form would come back with an empty branch list anyway.
+        when = f"erscheint am {book.published}" if book.is_preorder and book.published else "ist nicht lieferbar"
+        raise RuntimeError(
+            f'"{book.title}" {when} — der Shop bietet dafür keine Abholbestellung an '
+            f"(Verfügbarkeit laut Shop: {book.availability or 'unbekannt'}). "
+            + (
+                f"Ab dem {book.published} sollte die Abholbestellung möglich sein; "
+                if book.is_preorder and book.published
+                else ""
+            )
+            + "Vorbestellungen laufen im Shop nur über den Warenkorb, der ein Kundenkonto verlangt."
+        )
     resp = client.get(f"/reserve/nojs/{book.ean}")
     form = parse_reserve_form(ctools_html(resp), book.ean)
     store = pick_store(form.stores, args.store_match, book.availability)

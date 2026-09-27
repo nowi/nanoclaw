@@ -50,6 +50,10 @@ export interface BuchboxBook {
   availability: string;
   availability_schema?: string;
   url: string;
+  /** The shop says "Erscheint am <date>" — not published yet. */
+  is_preorder?: boolean;
+  /** False when the shop offers no Abholbestellung for this article. */
+  pickup_available?: boolean;
 }
 
 export interface BuchboxSearchRequest {
