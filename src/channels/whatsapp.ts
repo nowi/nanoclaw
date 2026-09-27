@@ -108,9 +108,69 @@ const SENT_MESSAGE_CACHE_MAX = 256;
 const RECONNECT_DELAY_MS = 5000;
 const PENDING_QUESTIONS_MAX = 64;
 
-/** Normalize an option label to a slash command: "Approve" → "/approve" */
-function optionToCommand(option: string): string {
-  return '/' + option.toLowerCase().replace(/\s+/g, '-');
+/**
+ * Slash commands for a question's option labels, positionally aligned with the
+ * input.
+ *
+ * Labels are presentation text and may contain characters a person cannot
+ * reasonably type. The shared approval card (src/modules/approvals/primitive.ts)
+ * ends its third label with U+2026 — "Reject with reason…" — which produced the
+ * untypeable `/reject-with-reason…`; replies are matched by exact equality, so
+ * plain ASCII never hit it and the option was reachable only by copy-pasting the
+ * rendered line. Everything outside [a-z0-9-] is therefore dropped.
+ *
+ * That makes the mapping lossy, so two labels can collide ("Yes" and "Yes!"),
+ * and a collision would silently resolve whichever option came first — hence the
+ * numeric suffix, plus a positional fallback for a label that sanitizes to
+ * nothing. Callers must derive both the rendered list and the reply match from
+ * this one function so the two cannot drift.
+ */
+export function optionCommands(labels: string[]): string[] {
+  const used = new Set<string>();
+  return labels.map((label, index) => {
+    const slug = label
+      .toLowerCase()
+      .replace(/\s+/g, '-')
+      .replace(/[^a-z0-9-]/g, '')
+      .replace(/-{2,}/g, '-')
+      .replace(/^-+|-+$/g, '');
+    let command = slug ? `/${slug}` : `/${index + 1}`;
+    if (used.has(command)) {
+      let suffix = 2;
+      while (used.has(`${command}-${suffix}`)) suffix++;
+      command = `${command}-${suffix}`;
+    }
+    used.add(command);
+    return command;
+  });
+}
+
+/**
+ * Strip variation selectors and skin-tone modifiers so 👍🏽 and 👍️ both read as
+ * a plain 👍. Alternation rather than one character class, which would trip
+ * no-misleading-character-class.
+ */
+export function baseEmoji(input: string): string {
+  return (input || '').replace(/\u{FE0E}|\u{FE0F}|\u{200D}|[\u{1F3FB}-\u{1F3FF}]/gu, '').trim();
+}
+
+/**
+ * The option VALUE a reaction answers on a question card, or null.
+ *
+ * Deliberately narrow: only the two values the shared approval card uses. A
+ * generic ask_user_question with options like "Yes"/"No" is left alone rather
+ * than guessed at — a wrong guess would resolve somebody's question for them.
+ * A removed reaction arrives as empty text and maps to null.
+ */
+export function reactionToOptionValue(emoji: string): 'approve' | 'reject' | null {
+  switch (baseEmoji(emoji)) {
+    case '\u{1F44D}':
+      return 'approve';
+    case '\u{1F44E}':
+      return 'reject';
+    default:
+      return null;
+  }
 }
 
 // --- Markdown → WhatsApp formatting ---
@@ -445,6 +505,10 @@ registerChannelAdapter('whatsapp', {
       {
         questionId: string;
         options: NormalizedOption[];
+        /** Exactly the commands rendered into the card, so replies cannot drift. */
+        commands: string[];
+        /** Platform id of the card message, so a reaction can name its target. */
+        messageId?: string;
       }
     >();
 
@@ -863,6 +927,45 @@ registerChannelAdapter('whatsapp', {
             // dropping the attachment (or the whole message, if uncaptioned).
             content = appendMediaFailureNote(content, failures);
 
+            // A reaction on a pending question card answers it: 👍 approve,
+            // 👎 reject. WhatsApp has no buttons, so this is the fastest way to
+            // answer an approval card, and unlike a slash command a reaction
+            // names the message it is on.
+            //
+            // Runs before the empty-message drop below, because a reaction
+            // carries no text of its own. DMs only: approval cards are always
+            // delivered to the approver's DM, and in a group any member could
+            // react, which would clear the card locally before the host got to
+            // reject them as unauthorized.
+            const reaction = normalized.reactionMessage ?? msg.message?.reactionMessage;
+            if (reaction?.text && reaction.key?.id) {
+              const botsOwnReaction = sentMessageCache.has(msg.key.id || '');
+              const card = pendingQuestions.get(chatJid);
+              const value = reactionToOptionValue(reaction.text);
+              if (!botsOwnReaction && !isGroup && card && value && card.messageId === reaction.key.id) {
+                const matched = card.options.find((o) => o.value === value);
+                if (matched) {
+                  const rawReactor = msg.key.participant || msg.key.remoteJid || '';
+                  const reactor = rawReactor.endsWith('@lid')
+                    ? await translateJid(rawReactor, msg.key.participantAlt)
+                    : rawReactor;
+                  const voterName = msg.pushName || reactor.split('@')[0];
+                  // Authorization stays in core: onAction → dispatchResponse →
+                  // isAuthorizedApprovalClick checks the reactor against the
+                  // approval's approver_user_id.
+                  setupConfig.onAction(card.questionId, matched.value, reactor);
+                  pendingQuestions.delete(chatJid);
+                  await sendRawMessage(chatJid, `${matched.selectedLabel} by ${voterName}`);
+                  log.info('Question answered by reaction', {
+                    questionId: card.questionId,
+                    value: matched.value,
+                    emoji: reaction.text,
+                  });
+                }
+              }
+              continue; // a reaction is never forwarded to the agent
+            }
+
             // Skip empty protocol messages (no text and no attachments)
             if (!content && attachments.length === 0) continue;
 
@@ -891,7 +994,8 @@ registerChannelAdapter('whatsapp', {
             const pending = pendingQuestions.get(chatJid);
             if (pending && content.startsWith('/')) {
               const cmd = content.trim().toLowerCase();
-              const matched = pending.options.find((o) => optionToCommand(o.label) === cmd);
+              const matchedIndex = pending.commands.indexOf(cmd);
+              const matched = matchedIndex < 0 ? undefined : pending.options[matchedIndex];
               if (matched) {
                 const voterName = msg.pushName || sender.split('@')[0];
                 setupConfig.onAction(pending.questionId, matched.value, sender);
@@ -1005,11 +1109,12 @@ registerChannelAdapter('whatsapp', {
           }
           const options: NormalizedOption[] = normalizeOptions(content.options as never);
 
-          const optionLines = options.map((o) => `  ${optionToCommand(o.label)}`).join('\n');
+          const commands = optionCommands(options.map((o) => o.label));
+          const optionLines = commands.map((command) => `  ${command}`).join('\n');
           const text = `*${title}*\n\n${question}\n\nReply with:\n${optionLines}`;
           const msgId = await sendRawMessage(platformId, text);
           if (msgId) {
-            pendingQuestions.set(platformId, { questionId, options });
+            pendingQuestions.set(platformId, { questionId, options, commands, messageId: msgId });
             if (pendingQuestions.size > PENDING_QUESTIONS_MAX) {
               const oldest = pendingQuestions.keys().next().value!;
               pendingQuestions.delete(oldest);
@@ -1021,12 +1126,23 @@ registerChannelAdapter('whatsapp', {
         // Reaction → emoji on a message
         if (content.operation === 'reaction' && content.messageId && content.emoji) {
           try {
-            await sock.sendMessage(platformId, {
+            const sentReaction = await sock.sendMessage(platformId, {
               react: {
                 text: content.emoji as string,
                 key: { remoteJid: platformId, id: content.messageId as string, fromMe: false },
               },
             });
+            // On a shared number the bot's own reaction echoes back with
+            // fromMe=true exactly like the operator's; the sent-cache is the
+            // only thing that tells them apart, so a reaction the bot sent must
+            // land in it or the bot could answer its own approval card.
+            if (sentReaction?.key?.id) {
+              sentMessageCache.set(sentReaction.key.id, sentReaction.message ?? {});
+              if (sentMessageCache.size > SENT_MESSAGE_CACHE_MAX) {
+                const oldest = sentMessageCache.keys().next().value!;
+                sentMessageCache.delete(oldest);
+              }
+            }
           } catch (err) {
             log.debug('Failed to send reaction', { platformId, err });
           }

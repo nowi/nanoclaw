@@ -15,12 +15,15 @@ import { describe, it, expect } from 'vitest';
 
 import {
   appendMediaFailureNote,
+  baseEmoji,
   computeIsMention,
   computeWhatsappDefaults,
   hasMentionPills,
   isBotMentionedInGroup,
   isBotTypedMention,
+  optionCommands,
   parseWhatsAppMentions,
+  reactionToOptionValue,
   resolveSharedMode,
   rewriteBotLidMention,
 } from './whatsapp.js';
@@ -329,5 +332,102 @@ describe('appendMediaFailureNote', () => {
     expect(appendMediaFailureNote('', ['image', 'document'])).toBe(
       '[image could not be downloaded] [document could not be downloaded]',
     );
+  });
+});
+
+/**
+ * Question option labels → slash commands.
+ *
+ * WhatsApp has no buttons, so an ask_question card renders its options as
+ * slash commands the approver types back, and the command must be typeable:
+ * the shared approval card's third label ends in U+2026, which used to yield
+ * `/reject-with-reason…` and could only be answered by copy-paste.
+ */
+describe('optionCommands', () => {
+  // The exact labels src/modules/approvals/primitive.ts puts on every module
+  // approval card (create_agent, install_packages, add_mcp_server).
+  const APPROVAL_LABELS = ['Approve', 'Reject', 'Reject with reason…'];
+
+  it('makes the approval card answerable with plain ASCII', () => {
+    expect(optionCommands(APPROVAL_LABELS)).toEqual(['/approve', '/reject', '/reject-with-reason']);
+  });
+
+  it('never emits a character outside the typeable set', () => {
+    for (const command of optionCommands(APPROVAL_LABELS)) {
+      expect(command).toMatch(/^\/[a-z0-9-]+$/);
+    }
+  });
+
+  it('lowercases and hyphenates whitespace', () => {
+    expect(optionCommands(['Ship It Now'])).toEqual(['/ship-it-now']);
+  });
+
+  it('strips punctuation, accents and emoji rather than leaving them untypeable', () => {
+    expect(optionCommands(['Yes, please!'])).toEqual(['/yes-please']);
+    expect(optionCommands(['✅ Approved'])).toEqual(['/approved']);
+  });
+
+  it('collapses runs of hyphens and trims them from the edges', () => {
+    expect(optionCommands(['-- Maybe / Later --'])).toEqual(['/maybe-later']);
+  });
+
+  it('keeps colliding labels distinguishable instead of silently aliasing them', () => {
+    // Both sanitize to /yes; a reply must not resolve the wrong option.
+    expect(optionCommands(['Yes', 'Yes!', 'Yes?'])).toEqual(['/yes', '/yes-2', '/yes-3']);
+  });
+
+  it('falls back to the 1-based position when a label sanitizes to nothing', () => {
+    expect(optionCommands(['…', 'OK'])).toEqual(['/1', '/ok']);
+  });
+
+  it('stays positionally aligned with its input', () => {
+    const labels = ['Approve', '🙅', 'Reject with reason…'];
+    const commands = optionCommands(labels);
+    expect(commands).toHaveLength(labels.length);
+    expect(commands[2]).toBe('/reject-with-reason');
+  });
+
+  it('returns nothing for no options', () => {
+    expect(optionCommands([])).toEqual([]);
+  });
+});
+
+/**
+ * Reaction → approval mapping.
+ *
+ * A 👍/👎 reaction on an approval card is far faster than typing, and unlike a
+ * slash command it names the message it is on. Two properties matter: the
+ * thumbs must resolve regardless of skin tone or variation selector, and
+ * anything else must map to null rather than be guessed at — a wrong guess
+ * would resolve somebody's question for them.
+ */
+describe('reactionToOptionValue', () => {
+  it('maps a plain thumbs up/down to approve/reject', () => {
+    expect(reactionToOptionValue('👍')).toBe('approve');
+    expect(reactionToOptionValue('👎')).toBe('reject');
+  });
+
+  it('ignores skin tone and variation selectors', () => {
+    for (const thumb of ['👍🏻', '👍🏽', '👍🏿', '👍️']) {
+      expect(reactionToOptionValue(thumb), thumb).toBe('approve');
+    }
+    for (const thumb of ['👎🏻', '👎🏽', '👎🏿', '👎️']) {
+      expect(reactionToOptionValue(thumb), thumb).toBe('reject');
+    }
+  });
+
+  it('refuses to guess at any other emoji', () => {
+    for (const other of ['❤️', '😀', '✅', '❌', '🙏', '🤔', 'x']) {
+      expect(reactionToOptionValue(other), other).toBeNull();
+    }
+  });
+
+  it('treats a removed reaction (empty text) as nothing', () => {
+    expect(reactionToOptionValue('')).toBeNull();
+  });
+
+  it('baseEmoji strips modifiers without mangling the codepoint', () => {
+    expect(baseEmoji('👍🏽')).toBe('👍');
+    expect(baseEmoji('👍')).toBe('👍');
   });
 });
