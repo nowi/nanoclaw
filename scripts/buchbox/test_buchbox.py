@@ -38,14 +38,18 @@ DETAIL_HTML = f"""<!DOCTYPE html><html><body>
 <p class="bonuswebshop-search-detail-availability-text">In 1-2 Werktagen im Laden</p>
 </body></html>"""
 
-RESERVE_FORM = f"""<form action="/reserve/nojs/{EAN}" method="post" id="bonuswebshopframe-reserve-form">
-<div class="form-radios" id="edit-store">
+STORE_RADIOS = """<div class="form-radios" id="edit-store">
   <label for="edit-store-0"><input id="edit-store-0" name="store" type="radio" value="0"/>Bitte wähle einen Abholort</label>
   <label for="edit-store-53"><input id="edit-store-53" name="store" type="radio" value="53"/>
     <div class="reserve-label"><strong>BUCHBOX! Kastanienallee</strong><br/>Kastanienallee 97<br/>10435 Berlin</div></label>
   <label for="edit-store-56"><input id="edit-store-56" name="store" type="radio" value="56"/>
     <div class="reserve-label"><strong>BUCHBOX! Bötzowkiez</strong><br/>Greifswalder Straße 33<br/>10405 Berlin</div></label>
-</div>
+</div>"""
+
+# {stores} is empty for an article the shop offers no pickup for — a
+# pre-order or an e-book renders the form with no branch at all.
+RESERVE_FORM_TMPL = f"""<form action="/reserve/nojs/{EAN}" method="post" id="bonuswebshopframe-reserve-form">
+{{stores}}
 <input name="name" type="text" value=""/>
 <input name="email" type="text" value=""/>
 <input name="phone" type="text" value=""/>
@@ -57,6 +61,9 @@ RESERVE_FORM = f"""<form action="/reserve/nojs/{EAN}" method="post" id="bonusweb
 <input name="Link" type="text" value=""/>
 <input name="op" type="submit" value="Senden"/>
 </form>"""
+
+RESERVE_FORM = RESERVE_FORM_TMPL.format(stores=STORE_RADIOS)
+RESERVE_FORM_NO_STORES = RESERVE_FORM_TMPL.format(stores="")
 
 
 def ctools(output: str) -> bytes:
@@ -86,6 +93,8 @@ class Stub(BaseHTTPRequestHandler):
         if self.path.startswith("/shop/item/"):
             return self._send(DETAIL_HTML.encode("utf-8"))
         if self.path.startswith("/reserve/nojs/"):
+            if Stub.mode == "no_stores":
+                return self._send(ctools(RESERVE_FORM_NO_STORES))
             return self._send(ctools(RESERVE_FORM))
         return self._send(b"not found", 404)
 
@@ -189,6 +198,16 @@ class BuchboxCliTest(unittest.TestCase):
         r = self.run_cli("order", EAN, "--execute", "--approved", "appr-2", "--honeypot-wait", "0")
         self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
         self.assertIn("E-Mail-Adresse ist erforderlich", r.stderr)
+
+    def test_article_without_pickup_says_so(self):
+        # A pre-order or e-book renders the reserve form with no branch at all.
+        # The message must name that, not blame the branch match.
+        Stub.mode, Stub.last_post = "no_stores", {}
+        r = self.run_cli("order", EAN)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("nicht zur Abholung", r.stderr)
+        self.assertNotIn("Keine Filiale enth", r.stderr)
+        self.assertEqual(Stub.last_post, {})
 
     def test_captcha_aborts(self):
         Stub.mode = "captcha"

@@ -452,7 +452,18 @@ def parse_reserve_form(html: str, ean: str) -> ReserveForm:
     return ReserveForm(action=action, fields=fields, stores=stores, fetched_at=time.monotonic())
 
 
-def pick_store(stores: list[Store], needle: str) -> Store:
+def pick_store(stores: list[Store], needle: str, availability: str = "") -> Store:
+    if not stores:
+        # The shop renders the reserve form without any branch when the article
+        # cannot be picked up at all — normal for titles that have not been
+        # published yet (Vorbestellung) and for e-books/downloads. Saying "no
+        # branch matches" here would blame the wrong thing.
+        detail = f" Verfügbarkeit laut Shop: {availability}." if availability else ""
+        raise RuntimeError(
+            "Dieser Artikel wird nicht zur Abholung angeboten — die Filialauswahl "
+            f"des Shops ist leer.{detail} Bei noch nicht erschienenen Titeln "
+            "(Vorbestellung) und bei E-Books/Downloads ist das normal."
+        )
     hits = [s for s in stores if needle.lower() in s.label.lower()]
     if not hits:
         listing = "\n".join(f"  {s.store_id}  {s.label}" for s in stores) or "  (keine)"
@@ -628,7 +639,7 @@ def do_order(client: Client, args, cfg: dict[str, str]) -> int:
     book = fetch_detail(client, ean)
     resp = client.get(f"/reserve/nojs/{book.ean}")
     form = parse_reserve_form(ctools_html(resp), book.ean)
-    store = pick_store(form.stores, args.store_match)
+    store = pick_store(form.stores, args.store_match, book.availability)
 
     if store.store_id != KNOWN_GREIFSWALDER_STORE_ID and DEFAULT_STORE_MATCH.lower() in store.label.lower():
         print(f"Hinweis: Filial-ID für {DEFAULT_STORE_MATCH} ist jetzt {store.store_id} "
