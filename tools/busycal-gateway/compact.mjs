@@ -54,8 +54,25 @@ function clip(text, max) {
   return t.length > max ? `${t.slice(0, max)}…` : t;
 }
 
-export function compactEvent(e, calendarTitles, timeZone, calendarAccounts) {
+/** BusyCal's recurrence record minus its defaults, with `until` in local time. */
+export function compactRecurrence(r, timeZone) {
+  if (!r || typeof r !== 'object') return undefined;
+  const { untilTimeZoneIdentifier, ...out } = r;
+  if (out.interval === 1) delete out.interval;
+  if (out.weekStart === 'monday') delete out.weekStart;
+  if (out.until) out.until = toLocal(out.until, timeZone);
+  return out;
+}
+
+/**
+ * Events in `editableCalendars` (the ones the gateway lets the agent change)
+ * keep their occurrence `id` and full repeat rule; everything else stays as
+ * small as possible.
+ */
+export function compactEvent(e, calendarTitles, timeZone, calendarAccounts, editableCalendars) {
+  const editable = editableCalendars?.has(e.calendarID);
   const out = {
+    ...(editable && e.id ? { id: e.id } : {}),
     title: e.title,
     start: toLocal(e.startDate, timeZone),
     end: toLocal(e.endDate, timeZone),
@@ -67,6 +84,7 @@ export function compactEvent(e, calendarTitles, timeZone, calendarAccounts) {
   if (e.showAs && e.showAs !== 'busy') out.showAs = e.showAs;
   if (e.eventStatus && e.eventStatus !== 'confirmed') out.status = e.eventStatus;
   if (e.isRecurring) out.recurring = true;
+  if (editable && e.recurrence) out.recurrence = compactRecurrence(e.recurrence, timeZone);
   const loc = typeof e.location === 'string' ? e.location : e.location?.title || e.location?.address;
   if (loc) out.location = clip(loc, 120);
   const org = person(e.organizer);
@@ -102,21 +120,22 @@ export function compactCalendar(c, accountTitles) {
 }
 
 /**
- * Rewrite a tools/call result. `ctx` = { calendarTitles, accountTitles, calendarAccounts, timeZone }.
+ * Rewrite a tools/call result. `ctx` = { calendarTitles, accountTitles, calendarAccounts, timeZone, editableCalendars }.
  * Unknown shapes pass through untouched (minus the duplicate structuredContent).
  */
 export function compactResult(toolName, result, ctx) {
   if (!result || result.isError) return result;
   const payload = result.structuredContent?.result ?? result.structuredContent;
   let compact;
+  const event = (e) => compactEvent(e, ctx.calendarTitles, ctx.timeZone, ctx.calendarAccounts, ctx.editableCalendars);
   switch (toolName) {
     case 'query_events':
     case 'selected_items':
-      compact = Array.isArray(payload) ? payload.map((e) => compactEvent(e, ctx.calendarTitles, ctx.timeZone, ctx.calendarAccounts)) : payload;
+      compact = Array.isArray(payload) ? payload.map(event) : payload;
       break;
     case 'query_items':
       compact = Array.isArray(payload)
-        ? payload.map((it) => (it.dueDate !== undefined || it.isCompleted !== undefined ? compactTask(it, ctx.calendarTitles, ctx.timeZone) : compactEvent(it, ctx.calendarTitles, ctx.timeZone, ctx.calendarAccounts)))
+        ? payload.map((it) => (it.dueDate !== undefined || it.isCompleted !== undefined ? compactTask(it, ctx.calendarTitles, ctx.timeZone) : event(it)))
         : payload;
       break;
     case 'query_tasks':
@@ -126,7 +145,9 @@ export function compactResult(toolName, result, ctx) {
       compact = Array.isArray(payload) ? payload.map((c) => compactCalendar(c, ctx.accountTitles)) : payload;
       break;
     case 'create_event':
-      compact = payload && typeof payload === 'object' && !Array.isArray(payload) ? compactEvent(payload, ctx.calendarTitles, ctx.timeZone, ctx.calendarAccounts) : payload;
+    case 'update_event':
+    case 'reschedule_event':
+      compact = payload && typeof payload === 'object' && !Array.isArray(payload) ? event(payload) : payload;
       break;
     default:
       compact = payload;
