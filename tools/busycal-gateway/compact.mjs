@@ -100,8 +100,10 @@ export function compactEvent(e, calendarTitles, timeZone, calendarAccounts, edit
   return out;
 }
 
-export function compactTask(t, calendarTitles, timeZone) {
-  const out = { title: t.title, calendar: calendarTitles.get(t.calendarID) ?? t.calendarID };
+/** Tasks in `editableTaskLists` keep their occurrence `id`, like editable events. */
+export function compactTask(t, calendarTitles, timeZone, editableTaskLists) {
+  const editable = editableTaskLists?.has(t.calendarID);
+  const out = { ...(editable && t.id ? { id: t.id } : {}), title: t.title, calendar: calendarTitles.get(t.calendarID) ?? t.calendarID };
   if (t.dueDate) out.due = toLocal(t.dueDate, timeZone);
   if (t.isCompleted || t.completed) out.completed = true;
   if (t.priority) out.priority = t.priority;
@@ -120,7 +122,7 @@ export function compactCalendar(c, accountTitles) {
 }
 
 /**
- * Rewrite a tools/call result. `ctx` = { calendarTitles, accountTitles, calendarAccounts, timeZone, editableCalendars }.
+ * Rewrite a tools/call result. `ctx` = { calendarTitles, accountTitles, calendarAccounts, timeZone, editableCalendars, editableTaskLists }.
  * Unknown shapes pass through untouched (minus the duplicate structuredContent).
  */
 export function compactResult(toolName, result, ctx) {
@@ -128,6 +130,7 @@ export function compactResult(toolName, result, ctx) {
   const payload = result.structuredContent?.result ?? result.structuredContent;
   let compact;
   const event = (e) => compactEvent(e, ctx.calendarTitles, ctx.timeZone, ctx.calendarAccounts, ctx.editableCalendars);
+  const task = (t) => compactTask(t, ctx.calendarTitles, ctx.timeZone, ctx.editableTaskLists);
   switch (toolName) {
     case 'query_events':
     case 'selected_items':
@@ -135,11 +138,11 @@ export function compactResult(toolName, result, ctx) {
       break;
     case 'query_items':
       compact = Array.isArray(payload)
-        ? payload.map((it) => (it.dueDate !== undefined || it.isCompleted !== undefined ? compactTask(it, ctx.calendarTitles, ctx.timeZone) : event(it)))
+        ? payload.map((it) => (it.dueDate !== undefined || it.isCompleted !== undefined ? task(it) : event(it)))
         : payload;
       break;
     case 'query_tasks':
-      compact = Array.isArray(payload) ? payload.map((t) => compactTask(t, ctx.calendarTitles, ctx.timeZone)) : payload;
+      compact = Array.isArray(payload) ? payload.map(task) : payload;
       break;
     case 'list_calendars':
       compact = Array.isArray(payload) ? payload.map((c) => compactCalendar(c, ctx.accountTitles)) : payload;
@@ -148,6 +151,11 @@ export function compactResult(toolName, result, ctx) {
     case 'update_event':
     case 'reschedule_event':
       compact = payload && typeof payload === 'object' && !Array.isArray(payload) ? event(payload) : payload;
+      break;
+    case 'create_task':
+    case 'update_task':
+    case 'defer_task':
+      compact = payload && typeof payload === 'object' && !Array.isArray(payload) ? task(payload) : payload;
       break;
     default:
       compact = payload;

@@ -30,6 +30,11 @@
  *                    first one, any other id is refused, and an edit is only
  *                    forwarded after get_item shows the event lives in one of
  *                    them. Events in these calendars carry their `id` in results.
+ *   BUSYCAL_TASK_CALENDAR_IDS
+ *                    comma-separated BusyCal calendarIDs of task lists (e.g. an
+ *                    Apple Reminders list, account "Reminders"). When set,
+ *                    create_task, update_task and defer_task are exposed, pinned
+ *                    the same way. Completing and deleting tasks stay hidden.
  */
 import http from 'node:http';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -52,6 +57,8 @@ const READ_ONLY_TOOLS = [
 ];
 // Edits of existing events; only ever exposed together with pinned calendars.
 const EDIT_TOOLS = ['update_event', 'reschedule_event', 'delete_event'];
+// Edits of existing tasks; only ever exposed together with pinned task lists.
+const TASK_EDIT_TOOLS = ['update_task', 'defer_task'];
 
 const BRIDGE = process.env.BUSYCAL_BRIDGE;
 const PORT = Number(process.env.BUSYCAL_PORT || 8765);
@@ -60,11 +67,15 @@ const TIME_ZONE = process.env.BUSYCAL_TZ || 'Europe/Berlin';
 const ALLOWED = new Set(
   (process.env.BUSYCAL_TOOLS ? process.env.BUSYCAL_TOOLS.split(',') : READ_ONLY_TOOLS).map((t) => t.trim()).filter(Boolean),
 );
-const CREATE_CALENDAR_IDS = (process.env.BUSYCAL_CREATE_CALENDAR_IDS || '')
-  .split(',')
-  .map((t) => t.trim())
-  .filter(Boolean);
+const idList = (v) =>
+  (v || '')
+    .split(',')
+    .map((t) => t.trim())
+    .filter(Boolean);
+const CREATE_CALENDAR_IDS = idList(process.env.BUSYCAL_CREATE_CALENDAR_IDS);
+const TASK_CALENDAR_IDS = idList(process.env.BUSYCAL_TASK_CALENDAR_IDS);
 if (CREATE_CALENDAR_IDS.length > 0) for (const t of ['create_event', ...EDIT_TOOLS]) ALLOWED.add(t);
+if (TASK_CALENDAR_IDS.length > 0) for (const t of ['create_task', ...TASK_EDIT_TOOLS]) ALLOWED.add(t);
 
 if (!BRIDGE) {
   console.error('BUSYCAL_BRIDGE is required');
@@ -95,59 +106,90 @@ const calendarAccounts = new Map(); // calendarID → account title
     const acct = accountTitles.get(c.accountID);
     if (acct) calendarAccounts.set(c.calendarID, acct);
   }
-  for (const id of CREATE_CALENDAR_IDS) {
+  for (const id of [...CREATE_CALENDAR_IDS, ...TASK_CALENDAR_IDS]) {
     const c = cals.find((x) => x.calendarID === id);
     if (!c) log('WARNING: pinned calendar id not found in BusyCal', { id });
     else if (!c.isWritable) log('WARNING: pinned calendar is not writable', { id, title: c.title });
   }
+  for (const id of TASK_CALENDAR_IDS) {
+    const c = cals.find((x) => x.calendarID === id);
+    if (c && !c.supportsTasks) log('WARNING: pinned task list does not support tasks', { id, title: c.title });
+  }
 }
-const pinnedLabel = CREATE_CALENDAR_IDS.map((id) => `"${calendarTitles.get(id) ?? id}"`).join(', ');
-const compactCtx = { calendarTitles, accountTitles, calendarAccounts, timeZone: TIME_ZONE, editableCalendars: new Set(CREATE_CALENDAR_IDS) };
+const labelOf = (ids) => ids.map((id) => `"${calendarTitles.get(id) ?? id}"`).join(', ');
+const pinnedLabel = labelOf(CREATE_CALENDAR_IDS);
+const taskLabel = labelOf(TASK_CALENDAR_IDS);
+const EVENTS = { ids: CREATE_CALENDAR_IDS, label: pinnedLabel, noun: 'event', plural: 'events', where: 'calendar', idFrom: 'query_events or create_event' };
+const TASKS = { ids: TASK_CALENDAR_IDS, label: taskLabel, noun: 'task', plural: 'tasks', where: 'list', idFrom: 'query_tasks or create_task' };
+const compactCtx = {
+  calendarTitles,
+  accountTitles,
+  calendarAccounts,
+  timeZone: TIME_ZONE,
+  editableCalendars: new Set(CREATE_CALENDAR_IDS),
+  editableTaskLists: new Set(TASK_CALENDAR_IDS),
+};
 
 const exposed = upstreamTools
   .filter((t) => ALLOWED.has(t.name))
   .map((t) => {
-    if (EDIT_TOOLS.includes(t.name)) {
+    const edit = EDIT_TOOLS.includes(t.name) ? EVENTS : TASK_EDIT_TOOLS.includes(t.name) ? TASKS : null;
+    if (edit) {
       return {
         ...t,
-        description: `${t.description ?? ''} RESTRICTED: only events in ${pinnedLabel} can be changed; query results carry an \`id\` exactly for those events. Events in other calendars are refused by the gateway.`.trim(),
+        description: `${t.description ?? ''} RESTRICTED: only ${edit.plural} in ${edit.label} can be changed; query results carry an \`id\` exactly for those ${edit.plural}. ${edit.plural[0].toUpperCase()}${edit.plural.slice(1)} in other ${edit.where}s are refused by the gateway.`.trim(),
       };
     }
-    if (t.name !== 'create_event' || CREATE_CALENDAR_IDS.length === 0) return t;
+    const pin = t.name === 'create_event' ? EVENTS : t.name === 'create_task' ? TASKS : null;
+    if (!pin || pin.ids.length === 0) return t;
     // Tell the agent the rule up front, and remove the illusion of choice.
     const schema = structuredClone(t.inputSchema ?? {});
     if (schema.properties?.calendarID) {
-      schema.properties.calendarID.description = `Optional. Only the pinned calendar(s) ${pinnedLabel} are permitted; omit to use ${pinnedLabel.split(', ')[0]}. Any other calendar is refused.`;
+      schema.properties.calendarID.description = `Optional. Only the pinned ${pin.where}(s) ${pin.label} are permitted; omit to use ${pin.label.split(', ')[0]}. Any other ${pin.where} is refused.`;
     }
+    const note = pin === EVENTS ? ` (the operator's private calendar)` : '';
     return {
       ...t,
-      description: `${t.description ?? ''} RESTRICTED: events are always created in the calendar ${pinnedLabel} (the operator's private calendar); other calendars are refused by the gateway.`.trim(),
+      description: `${t.description ?? ''} RESTRICTED: ${pin.plural} are always created in the ${pin.where} ${pin.label}${note}; other ${pin.where}s are refused by the gateway.`.trim(),
       inputSchema: schema,
     };
   });
 
 const refuse = (text) => ({ isError: true, content: [{ type: 'text', text }] });
 
-/** Edits are forwarded only for events that live in a pinned calendar. Returns a refusal, or null to proceed. */
-async function checkEditable(name, args) {
+/** Edits are forwarded only for items that live in a pinned calendar/list. Returns a refusal, or null to proceed. */
+async function checkEditable(name, args, pin) {
   const itemID = typeof args.itemID === 'string' && args.itemID ? args.itemID : typeof args.id === 'string' ? args.id : null;
-  if (!itemID) return refuse(`${name} needs the event's \`id\` from query_events or create_event.`);
+  if (!itemID) return refuse(`${name} needs the ${pin.noun}'s \`id\` from ${pin.idFrom}.`);
   const found = await upstream.callTool({ name: 'get_item', arguments: { itemID } });
   if (found.isError) {
     const reason = found.content?.map((c) => c.text).join(' ').replace(/^get_item failed:\s*/, '') || 'unknown error';
-    return refuse(`Could not find event '${itemID}': ${reason}. Re-query to get a current \`id\`.`);
+    return refuse(`Could not find ${pin.noun} '${itemID}': ${reason}. Re-query to get a current \`id\`.`);
   }
   const item = found.structuredContent?.result;
   const calendarID = item?.calendarID;
-  if (!calendarID || !CREATE_CALENDAR_IDS.includes(calendarID)) {
-    log(`refused ${name} — calendar not permitted`, { title: item?.title, calendar: calendarTitles.get(calendarID) ?? calendarID ?? null });
-    return refuse(`Refused: only events in ${pinnedLabel} can be changed. '${item?.title ?? itemID}' is in '${calendarTitles.get(calendarID) ?? calendarID}'.`);
+  if (!calendarID || !pin.ids.includes(calendarID)) {
+    log(`refused ${name} — ${pin.where} not permitted`, { title: item?.title, calendar: calendarTitles.get(calendarID) ?? calendarID ?? null });
+    return refuse(`Refused: only ${pin.plural} in ${pin.label} can be changed. '${item?.title ?? itemID}' is in '${calendarTitles.get(calendarID) ?? calendarID}'.`);
   }
-  log(name, { title: item.title, start: item.startDate, scope: args.scope ?? null, calendar: calendarTitles.get(calendarID) ?? calendarID });
+  log(name, { title: item.title, start: item.startDate ?? item.dueDate, scope: args.scope ?? null, calendar: calendarTitles.get(calendarID) ?? calendarID });
+  return null;
+}
+
+/** Creates go to a pinned calendar/list: a missing calendarID gets the first one, any other is refused. */
+function pinCreate(name, args, pin) {
+  const requested = typeof args.calendarID === 'string' && args.calendarID.trim() ? args.calendarID.trim() : null;
+  if (requested && !pin.ids.includes(requested)) {
+    log(`refused ${name} — ${pin.where} not permitted`, { requested, title: calendarTitles.get(requested) ?? null });
+    return refuse(
+      `Refused: ${pin.plural} may only be created in ${pin.label}. ${pin.where[0].toUpperCase()}${pin.where.slice(1)} '${calendarTitles.get(requested) ?? requested}' is not permitted. Omit calendarID to use the permitted ${pin.where}.`,
+    );
+  }
+  args.calendarID = requested ?? pin.ids[0];
   return null;
 }
 const hidden = upstreamTools.filter((t) => !ALLOWED.has(t.name)).map((t) => t.name);
-log('connected to BusyCal bridge', { exposed: exposed.map((t) => t.name), hidden, createCalendars: pinnedLabel || null, timeZone: TIME_ZONE, calendars: calendarTitles.size });
+log('connected to BusyCal bridge', { exposed: exposed.map((t) => t.name), hidden, createCalendars: pinnedLabel || null, taskLists: taskLabel || null, timeZone: TIME_ZONE, calendars: calendarTitles.size });
 
 // ── downstream: stateless Streamable HTTP, one Server per request ─────────
 function makeServer() {
@@ -161,17 +203,15 @@ function makeServer() {
     }
     const args = { ...(req.params.arguments ?? {}) };
     if (name === 'create_event') {
-      const requested = typeof args.calendarID === 'string' && args.calendarID.trim() ? args.calendarID.trim() : null;
-      if (requested && !CREATE_CALENDAR_IDS.includes(requested)) {
-        log('refused create_event — calendar not permitted', { requested, title: calendarTitles.get(requested) ?? null });
-        return refuse(
-          `Refused: events may only be created in ${pinnedLabel}. Calendar '${calendarTitles.get(requested) ?? requested}' is not permitted. Omit calendarID to use the permitted calendar.`,
-        );
-      }
-      args.calendarID = requested ?? CREATE_CALENDAR_IDS[0];
+      const refusal = pinCreate(name, args, EVENTS);
+      if (refusal) return refusal;
       log('create_event', { title: args.title, startDate: args.startDate, recurrence: args.recurrence ?? null, calendar: calendarTitles.get(args.calendarID) ?? args.calendarID });
-    } else if (EDIT_TOOLS.includes(name)) {
-      const refusal = await checkEditable(name, args);
+    } else if (name === 'create_task') {
+      const refusal = pinCreate(name, args, TASKS);
+      if (refusal) return refusal;
+      log('create_task', { title: args.title, dueDate: args.dueDate ?? null, calendar: calendarTitles.get(args.calendarID) ?? args.calendarID });
+    } else if (EDIT_TOOLS.includes(name) || TASK_EDIT_TOOLS.includes(name)) {
+      const refusal = await checkEditable(name, args, EDIT_TOOLS.includes(name) ? EVENTS : TASKS);
       if (refusal) return refusal;
     } else {
       log('tool call', { name });
