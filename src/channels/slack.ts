@@ -17,10 +17,12 @@
 import { createSlackAdapter, type SlackAdapter } from '@chat-adapter/slack';
 
 import { readEnvFile } from '../env.js';
-import type { ChannelAdapter, ChannelContextDefaults, ChannelDefaults } from './adapter.js';
+import { log } from '../log.js';
+import type { ChannelAdapter, ChannelDefaults } from './adapter.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
-import { extractSlackRawText } from './slack-raw-text.js';
+import { setSlackAuthorIsBotResolver } from './slack-a2a-guard.js';
+import { slackRawTextExtractor } from './slack-raw-text.js';
 
 /**
  * Dedicated bot app on a threaded platform. group threads:true keeps
@@ -69,6 +71,14 @@ export const SLACK_DEFAULTS: ChannelDefaults = {
   },
   mentions: 'platform',
 };
+
+/**
+ * Slack caps markdown at 12,000 characters and the adapter doesn't split, so
+ * longer replies failed every retry. The 2,000 gap covers what the adapter adds
+ * after our split: each `@name` resolved to `<@U…>` grows ~10 characters, so a
+ * part with ~200 resolved mentions can still fail.
+ */
+export const SLACK_MAX_TEXT_LENGTH = 10_000;
 
 /**
  * Classify a Slack conversation for consumers that render it to a human
@@ -127,6 +137,103 @@ export async function resolveSlackConversation(
   }
 }
 
+/**
+ * The bot guard's DM author check: whether a Slack user is a bot, from the
+ * adapter's cached users.info. Null when the lookup finds no one, so the
+ * guard keeps the bot rule and the message stays dropped.
+ */
+export async function slackAuthorIsBot(slackAdapter: SlackAdapter, userId: string): Promise<boolean | null> {
+  const user = await slackAdapter.getUser(userId);
+  return user?.isBot ?? null;
+}
+
+/**
+ * Card text reaches Block Kit as raw mrkdwn, where `&`, `<` and `>` are control
+ * characters (links, mentions). Entity-escape them so untrusted values in
+ * approval cards show as typed; a word joiner after `@` keeps a bare
+ * @here/@channel/@everyone from becoming a mention.
+ */
+export function escapeSlackMrkdwn(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/@(here|channel|everyone)\b/gi, '@\u2060$1');
+}
+
+/** Escape only the notification title; the Block Kit plain-text header stays exact. */
+export function escapeSlackTitle(title: string): string {
+  return title.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+export function escapeCardTitles(adapter: Pick<SlackAdapter, 'webClient'>): void {
+  // The SDK posts cards through its transport client; webClient is a separate
+  // token-scoped client in newer releases. Older releases use webClient itself.
+  const transport = adapter as unknown as { _client?: SlackAdapter['webClient'] };
+  const chat = (transport._client ?? adapter.webClient)?.chat;
+  if (!chat) return;
+  const safeNotification = <T extends object>(args: T): T => {
+    const payload = args as { text?: unknown; blocks?: unknown };
+    if (typeof payload.text !== 'string' || !Array.isArray(payload.blocks)) return args;
+    const header = payload.blocks.find((block) => block.type === 'header' && block.text?.type === 'plain_text');
+    const title = header?.text?.text;
+    return typeof title === 'string' && title
+      ? { ...args, text: payload.text.replace(title, () => escapeSlackTitle(title)) }
+      : args;
+  };
+  const post = chat.postMessage.bind(chat);
+  chat.postMessage = (args) => post(safeNotification(args));
+  const update = chat.update.bind(chat);
+  chat.update = (args) => update(safeNotification(args));
+}
+
+/** Slack's answer for an app without the assistant scope (a plain, non-agent-view app). */
+function isMissingAssistantScope(err: unknown): boolean {
+  const data = (err as { data?: { error?: string; needed?: string } } | null)?.data;
+  return data?.error === 'missing_scope' && (data.needed ?? '').split(',').includes('assistant:write');
+}
+
+/**
+ * Agent-DM decoration: pinned suggested prompts and per-thread titles. Ids go
+ * through the SDK's own codec (`slack:<channel>[:<ts>]`), as delivery does.
+ * Slack errors reject so callers can log or retry (titles fail until the
+ * assistant thread exists).
+ */
+export function slackAgentDmDecorations(
+  slackAdapter: Pick<SlackAdapter, 'decodeThreadId' | 'setSuggestedPrompts' | 'setAssistantTitle'>,
+  instance = 'slack',
+): Required<Pick<ChannelAdapter, 'setSuggestedPrompts' | 'setThreadTitle'>> {
+  // Nothing records whether an app was provisioned with agent_view, so the
+  // bot's first missing_scope answer decides: decoration is then off for
+  // this bot, with one info line instead of a warn per welcome and thread.
+  let assistantScope = true;
+  const assistantCall = async (call: () => Promise<void>): Promise<void> => {
+    if (!assistantScope) return;
+    try {
+      await call();
+    } catch (err) {
+      if (!isMissingAssistantScope(err)) throw err;
+      if (!assistantScope) return;
+      assistantScope = false;
+      log.info('Slack app has no assistant:write; agent DM prompts and thread titles are off', { instance });
+    }
+  };
+  return {
+    async setSuggestedPrompts(platformId, prompts, title) {
+      const { channel } = slackAdapter.decodeThreadId(platformId);
+      // No thread_ts: under agent_view the prompts pin to the top of the DM.
+      await assistantCall(() => slackAdapter.setSuggestedPrompts(channel, undefined, prompts, title));
+    },
+    async setThreadTitle(_platformId, threadId, title) {
+      const { channel, threadTs } = slackAdapter.decodeThreadId(threadId);
+      // A DM-level id (the welcome session's) has no thread to title; skip it
+      // like the SDK's startTyping does, instead of a warn on every install.
+      if (!threadTs) return;
+      await assistantCall(() => slackAdapter.setAssistantTitle(channel, threadTs, title));
+    },
+  };
+}
+
 /** Construction knobs for one Slack bot identity. */
 export interface SlackBridgeOptions {
   /**
@@ -174,12 +281,17 @@ export function createSlackBridge(options: SlackBridgeOptions = {}): ChannelAdap
     appToken,
     mode: appToken ? 'socket' : 'webhook',
   });
+  setSlackAuthorIsBotResolver(options.instanceKey ?? 'slack', (userId) => slackAuthorIsBot(slackAdapter, userId));
+  escapeCardTitles(slackAdapter);
   const bridge = createChatSdkBridge({
     adapter: slackAdapter,
-    extractRawText: extractSlackRawText,
+    extractRawText: slackRawTextExtractor(slackAdapter),
+    // Spread, so an older core without this option still type-checks (and ignores it).
+    ...{ escapeCardText: escapeSlackMrkdwn },
     instance: options.instanceKey, // undefined ⇒ default instance (keyed by channelType)
     concurrency: 'concurrent',
     supportsThreads: true,
+    maxTextLength: SLACK_MAX_TEXT_LENGTH,
     defaults: SLACK_DEFAULTS,
   });
   bridge.resolveChannelName = async (platformId: string) => {
@@ -196,6 +308,7 @@ export function createSlackBridge(options: SlackBridgeOptions = {}): ChannelAdap
   // rides on the returned object until the core seam lands.
   return Object.assign(bridge, {
     resolveConversation: (platformId: string) => resolveSlackConversation(slackAdapter, platformId),
+    ...slackAgentDmDecorations(slackAdapter, options.instanceKey),
   });
 }
 
