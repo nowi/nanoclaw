@@ -20,6 +20,7 @@ const TEST_DIR = '/tmp/nanoclaw-test-upgrade-state';
 import { notifyOperator, readHostStatus } from './host-status.js';
 import {
   checkLocalCommits,
+  currentUpgradeState,
   enforceUpgradeTripwire,
   getCodeIdentity,
   getCodeVersion,
@@ -106,6 +107,16 @@ describe('upgrade-state', () => {
 
   it('markerPath is upgrade-state.json under the data dir', () => {
     expect(markerPath()).toBe(path.join(TEST_DIR, 'upgrade-state.json'));
+    expect(markerPath('/srv/nanoclaw')).toBe(path.join('/srv/nanoclaw', 'data', 'upgrade-state.json'));
+  });
+
+  it('currentUpgradeState returns the marker only while it matches the checkout', () => {
+    expect(currentUpgradeState()).toBeNull();
+    writeUpgradeState({ version: '0.0.0-nope', via: 'test' });
+    expect(currentUpgradeState()).toBeNull();
+    const written = writeUpgradeState({ via: 'update-nanoclaw', channel: 'stable', ref: 'refs/tags/v1' });
+    expect(currentUpgradeState()).toEqual(written);
+    expect(written).toMatchObject({ channel: 'stable', ref: 'refs/tags/v1' });
   });
 
   it('enforceUpgradeTripwire exits when not current and passes when current', () => {
@@ -139,18 +150,21 @@ describe('git-less runtimes', () => {
     return GITLESS;
   }
 
-  function writeMarker(marker: Record<string, string>): void {
-    fs.mkdirSync(TEST_DIR, { recursive: true });
-    fs.writeFileSync(markerPath(), JSON.stringify({ updatedAt: new Date().toISOString(), via: 'update', ...marker }));
+  function writeMarker(marker: Record<string, string>, projectRoot?: string): void {
+    fs.mkdirSync(path.dirname(markerPath(projectRoot)), { recursive: true });
+    fs.writeFileSync(
+      markerPath(projectRoot),
+      JSON.stringify({ updatedAt: new Date().toISOString(), via: 'update', ...marker }),
+    );
   }
 
   it('accepts a version-matching marker when Git cannot identify the checkout', () => {
-    writeMarker({ version: '9.9.9', commit: 'a'.repeat(40), tree: 'b'.repeat(40) });
+    writeMarker({ version: '9.9.9', commit: 'a'.repeat(40), tree: 'b'.repeat(40) }, GITLESS);
     expect(isUpgradeCurrent(gitlessCheckout('9.9.9'))).toBe(true);
   });
 
   it('still trips on a version mismatch when Git is unavailable', () => {
-    writeMarker({ version: '1.0.0', commit: 'a'.repeat(40), tree: 'b'.repeat(40) });
+    writeMarker({ version: '1.0.0', commit: 'a'.repeat(40), tree: 'b'.repeat(40) }, GITLESS);
     expect(isUpgradeCurrent(gitlessCheckout('9.9.9'))).toBe(false);
   });
 
@@ -194,22 +208,28 @@ describe('local commits', () => {
   beforeEach(() => {
     root = fs.mkdtempSync('/tmp/nanoclaw-local-commits-');
     git('init', '-q', '-b', 'main');
+    fs.writeFileSync(path.join(root, '.gitignore'), 'data/\n');
     commitFile('package.json', JSON.stringify({ version: '1.0.0' }));
     git('remote', 'add', 'upstream', 'https://github.com/nanocoai/nanoclaw.git');
     git('update-ref', 'refs/remotes/upstream/main', 'HEAD');
-    writeUpgradeState({ via: 'test', projectRoot: root });
+    writeUpgradeState({ via: 'test', channel: 'stable', ref: 'refs/tags/v1.0.0', projectRoot: root });
     vi.mocked(notifyOperator).mockClear();
   });
   afterEach(() => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  it('accepts a local commit and re-stamps the marker to it', () => {
+  it('accepts a local commit and re-stamps the marker to it, keeping channel and ref', () => {
     commitFile('tools/gateway.mjs', 'export {};\n');
     expect(checkLocalCommits(root)).toMatchObject({ local: true });
 
     expect(() => enforceUpgradeTripwire(root)).not.toThrow();
-    expect(readUpgradeState()).toMatchObject({ commit: git('rev-parse', 'HEAD'), via: 'local-commit' });
+    expect(readUpgradeState(root)).toMatchObject({
+      commit: git('rev-parse', 'HEAD'),
+      via: 'local-commit',
+      channel: 'stable',
+      ref: 'refs/tags/v1.0.0',
+    });
     expect(isUpgradeCurrent(root)).toBe(true);
   });
 

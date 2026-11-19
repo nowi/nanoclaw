@@ -10,7 +10,8 @@
  * Only the sanctioned paths call writeUpgradeState(), plus the tripwire
  * itself when what changed is only the operator's own local commits;
  * clearing the tripwire by hand is the same `set` — see
- * docs/upgrade-recovery.md.
+ * docs/upgrade-recovery.md. Setup's own local commits
+ * (setup/lib/setup-commit.ts) carry a current marker forward.
  */
 import fs from 'fs';
 import path from 'path';
@@ -26,6 +27,9 @@ export interface UpgradeState {
   tree: string;
   updatedAt: string;
   via: string;
+  /** Update channel and ref the updater merged; absent for setup and older stamps. */
+  channel?: string;
+  ref?: string;
 }
 
 export interface CodeIdentity {
@@ -85,19 +89,20 @@ export function getCodeIdentity(projectRoot: string = process.cwd()): CodeIdenti
  * Never throws — a boot gate must fail closed (treat anything it can't trust
  * as "no valid marker" → trip), not crash with a stack trace.
  */
-export function readUpgradeState(): UpgradeState | null {
+export function readUpgradeState(projectRoot?: string): UpgradeState | null {
+  const marker = markerPath(projectRoot);
   let raw: string;
   try {
-    raw = fs.readFileSync(MARKER_PATH, 'utf8');
+    raw = fs.readFileSync(marker, 'utf8');
   } catch (e: unknown) {
     if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null;
-    log.warn('Could not read upgrade marker; treating as absent', { path: MARKER_PATH, err: String(e) });
+    log.warn('Could not read upgrade marker; treating as absent', { path: marker, err: String(e) });
     return null;
   }
   try {
     return JSON.parse(raw) as UpgradeState;
   } catch {
-    log.warn('Upgrade marker is corrupt; treating as absent', { path: MARKER_PATH });
+    log.warn('Upgrade marker is corrupt; treating as absent', { path: marker });
     return null;
   }
 }
@@ -106,7 +111,13 @@ export function readUpgradeState(): UpgradeState | null {
  * Stamp the marker. Only the sanctioned paths (setup / update / migrate)
  * call this on success; `version` defaults to the current code version.
  */
-export function writeUpgradeState(opts: { version?: string; via: string; projectRoot?: string }): UpgradeState {
+export function writeUpgradeState(opts: {
+  version?: string;
+  via: string;
+  channel?: string;
+  ref?: string;
+  projectRoot?: string;
+}): UpgradeState {
   const identity = getCodeIdentity(opts.projectRoot);
   const state: UpgradeState = {
     ...identity,
@@ -114,14 +125,22 @@ export function writeUpgradeState(opts: { version?: string; via: string; project
     updatedAt: new Date().toISOString(),
     via: opts.via,
   };
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(MARKER_PATH, JSON.stringify(state, null, 2) + '\n');
+  if (opts.channel !== undefined) state.channel = opts.channel;
+  if (opts.ref !== undefined) state.ref = opts.ref;
+  const marker = markerPath(opts.projectRoot);
+  fs.mkdirSync(path.dirname(marker), { recursive: true });
+  fs.writeFileSync(marker, JSON.stringify(state, null, 2) + '\n');
   return state;
 }
 
+/** The marker when it matches the checkout exactly, else null. */
+export function currentUpgradeState(projectRoot?: string): UpgradeState | null {
+  return isUpgradeCurrent(projectRoot) ? readUpgradeState(projectRoot) : null;
+}
+
 /** True when the marker exists and matches the exact running checkout. */
-export function isUpgradeCurrent(projectRoot: string = process.cwd()): boolean {
-  const state = readUpgradeState();
+export function isUpgradeCurrent(projectRoot?: string): boolean {
+  const state = readUpgradeState(projectRoot);
   if (state === null) return false;
   try {
     const code = getCodeIdentity(projectRoot);
@@ -147,12 +166,14 @@ export function isUpgradeCurrent(projectRoot: string = process.cwd()): boolean {
   }
 }
 
-/** Absolute path to the marker file. */
-export function markerPath(): string {
-  return MARKER_PATH;
+/** Absolute path to the marker file: this process's data dir, or `<projectRoot>/data`. */
+export function markerPath(projectRoot?: string): string {
+  return projectRoot === undefined ? MARKER_PATH : path.join(projectRoot, 'data', 'upgrade-state.json');
 }
 
-export type LocalCommitCheck = { local: true; commits: string[] } | { local: false; reason: string };
+export type LocalCommitCheck =
+  | { local: true; commits: string[]; recorded: UpgradeState }
+  | { local: false; reason: string };
 
 /**
  * Whether everything since the recorded marker is the operator's own
@@ -161,12 +182,13 @@ export type LocalCommitCheck = { local: true; commits: string[] } | { local: fal
  * of them from the official remote, touching no gated path. Anything it
  * cannot verify counts as not local — the tripwire still fails closed.
  */
-export function checkLocalCommits(projectRoot: string = process.cwd()): LocalCommitCheck {
-  const recorded = readUpgradeState();
+export function checkLocalCommits(projectRoot?: string): LocalCommitCheck {
+  const recorded = readUpgradeState(projectRoot);
   if (recorded === null) return { local: false, reason: 'there is no upgrade marker' };
 
+  const cwd = projectRoot ?? process.cwd();
   const git = (...args: string[]): string =>
-    execFileSync('git', args, { cwd: projectRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
   const lines = (out: string): string[] => out.split('\n').filter(Boolean);
 
   try {
@@ -204,7 +226,7 @@ export function checkLocalCommits(projectRoot: string = process.cwd()): LocalCom
     );
     if (gated.length > 0) return { local: false, reason: `they change ${gated.join(', ')}` };
 
-    return { local: true, commits };
+    return { local: true, commits, recorded };
   } catch (err) {
     return { local: false, reason: `the commits could not be inspected (${String(err)})` };
   }
@@ -216,12 +238,14 @@ export function checkLocalCommits(projectRoot: string = process.cwd()): LocalCom
  * just ran the upgrade to act on automatically. The operator's own local
  * commits (see checkLocalCommits) are accepted and stamped instead.
  */
-export function enforceUpgradeTripwire(projectRoot: string = process.cwd()): void {
+export function enforceUpgradeTripwire(projectRoot?: string): void {
   if (isUpgradeCurrent(projectRoot)) return;
 
   const localCheck = checkLocalCommits(projectRoot);
   if (localCheck.local) {
-    const state = writeUpgradeState({ via: 'local-commit', projectRoot });
+    // Same carry-forward as setup's own commits: keep the channel and ref.
+    const { channel, ref } = localCheck.recorded;
+    const state = writeUpgradeState({ via: 'local-commit', channel, ref, projectRoot });
     log.warn('Upgrade tripwire: accepted local commits and re-stamped the marker', {
       commits: localCheck.commits.length,
       commit: state.commit,
@@ -230,7 +254,7 @@ export function enforceUpgradeTripwire(projectRoot: string = process.cwd()): voi
   }
 
   const code = getCodeIdentity(projectRoot);
-  const recorded = readUpgradeState();
+  const recorded = readUpgradeState(projectRoot);
   const gitUnavailable = code.commit === 'unknown' || code.tree === 'unknown';
   const exactCheckoutChanged =
     recorded !== null &&
