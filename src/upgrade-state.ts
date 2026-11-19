@@ -7,14 +7,17 @@
  * install was updated by a raw `git pull` instead of the supported flow.
  *
  * The marker lives in `data/` (gitignored), so a `git pull` can't touch it.
- * Only the sanctioned paths call writeUpgradeState(); clearing the tripwire
- * by hand is the same `set` — see docs/upgrade-recovery.md.
+ * Only the sanctioned paths call writeUpgradeState(), plus the tripwire
+ * itself when what changed is only the operator's own local commits;
+ * clearing the tripwire by hand is the same `set` — see
+ * docs/upgrade-recovery.md.
  */
 import fs from 'fs';
 import path from 'path';
 import { execFileSync } from 'child_process';
 
 import { DATA_DIR } from './config.js';
+import { notifyOperator, readHostStatus, writeHostStatus } from './host-status.js';
 import { log } from './log.js';
 
 export interface UpgradeState {
@@ -33,6 +36,24 @@ export interface CodeIdentity {
 
 const MARKER_PATH = path.join(DATA_DIR, 'upgrade-state.json');
 const FIX_COMMAND = 'pnpm exec tsx scripts/upgrade-state.ts set';
+
+/**
+ * Paths whose change needs work only the sanctioned flow does — a migration
+ * to run, dependencies to install, an image to rebuild. A local commit that
+ * touches one still trips. A trailing slash means "anything under".
+ */
+const GATED_PATHS = [
+  'src/db/migrations/',
+  'package.json',
+  'pnpm-lock.yaml',
+  'pnpm-workspace.yaml',
+  'container/Dockerfile',
+  'container/agent-runner/package.json',
+  'container/agent-runner/bun.lock',
+];
+
+/** Same rule /update-nanoclaw uses to find the official remote, plus the pre-rename owner. */
+const OFFICIAL_REPO_URL = /(^|[:/])(nanocoai|qwibitai)\/nanoclaw(\.git)?$/i;
 
 /** Version the running code declares, read from package.json. */
 export function getCodeVersion(projectRoot: string = process.cwd()): string {
@@ -131,15 +152,84 @@ export function markerPath(): string {
   return MARKER_PATH;
 }
 
+export type LocalCommitCheck = { local: true; commits: string[] } | { local: false; reason: string };
+
+/**
+ * Whether everything since the recorded marker is the operator's own
+ * customization rather than an update that skipped the sanctioned flow:
+ * linear commits on top of the recorded checkout, at the same version, none
+ * of them from the official remote, touching no gated path. Anything it
+ * cannot verify counts as not local — the tripwire still fails closed.
+ */
+export function checkLocalCommits(projectRoot: string = process.cwd()): LocalCommitCheck {
+  const recorded = readUpgradeState();
+  if (recorded === null) return { local: false, reason: 'there is no upgrade marker' };
+
+  const git = (...args: string[]): string =>
+    execFileSync('git', args, { cwd: projectRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  const lines = (out: string): string[] => out.split('\n').filter(Boolean);
+
+  try {
+    const code = getCodeIdentity(projectRoot);
+    if (code.commit === 'unknown') return { local: false, reason: 'Git cannot identify this checkout' };
+    if (recorded.version !== code.version) {
+      return { local: false, reason: `the version changed (${recorded.version} → ${code.version})` };
+    }
+    try {
+      git('merge-base', '--is-ancestor', recorded.commit, 'HEAD');
+    } catch {
+      return { local: false, reason: 'the recorded commit is not an ancestor of HEAD (rebased or reset)' };
+    }
+
+    const range = `${recorded.commit}..HEAD`;
+    const commits = lines(git('rev-list', range));
+    if (commits.length === 0) return { local: false, reason: 'the marker does not match this commit' };
+    if (git('rev-list', '--merges', range)) return { local: false, reason: 'a merge brought in other history' };
+
+    const remotes = lines(git('remote'));
+    const upstream = remotes.includes('upstream')
+      ? 'upstream'
+      : remotes.find((r) => OFFICIAL_REPO_URL.test(git('remote', 'get-url', r)));
+    if (!upstream) return { local: false, reason: 'no official remote to tell local commits apart from updates' };
+    if (!git('for-each-ref', '--count=1', `refs/remotes/${upstream}`)) {
+      return { local: false, reason: `remote ${upstream} has never been fetched` };
+    }
+    const notUpstream = lines(git('rev-list', range, '--not', `--remotes=${upstream}`));
+    if (notUpstream.length !== commits.length) {
+      return { local: false, reason: `${commits.length - notUpstream.length} commit(s) come from ${upstream}` };
+    }
+
+    const gated = lines(git('diff', '--name-only', range)).filter((file) =>
+      GATED_PATHS.some((p) => (p.endsWith('/') ? file.startsWith(p) : file === p)),
+    );
+    if (gated.length > 0) return { local: false, reason: `they change ${gated.join(', ')}` };
+
+    return { local: true, commits };
+  } catch (err) {
+    return { local: false, reason: `the commits could not be inspected (${String(err)})` };
+  }
+}
+
 /**
  * Startup gate. If the install didn't reach the current version through a
  * sanctioned path, stop with a message written for the coding agent that
- * just ran the upgrade to act on automatically.
+ * just ran the upgrade to act on automatically. The operator's own local
+ * commits (see checkLocalCommits) are accepted and stamped instead.
  */
-export function enforceUpgradeTripwire(): void {
-  if (isUpgradeCurrent()) return;
+export function enforceUpgradeTripwire(projectRoot: string = process.cwd()): void {
+  if (isUpgradeCurrent(projectRoot)) return;
 
-  const code = getCodeIdentity();
+  const localCheck = checkLocalCommits(projectRoot);
+  if (localCheck.local) {
+    const state = writeUpgradeState({ via: 'local-commit', projectRoot });
+    log.warn('Upgrade tripwire: accepted local commits and re-stamped the marker', {
+      commits: localCheck.commits.length,
+      commit: state.commit,
+    });
+    return;
+  }
+
+  const code = getCodeIdentity(projectRoot);
   const recorded = readUpgradeState();
   const gitUnavailable = code.commit === 'unknown' || code.tree === 'unknown';
   const exactCheckoutChanged =
@@ -158,6 +248,7 @@ export function enforceUpgradeTripwire(): void {
           'after pulling upstream changes or committing a local customization.',
           'Run /update-nanoclaw for upstream changes. For an intentional local',
           'commit, follow the local-customization steps in the recovery guide.',
+          `Not accepted as a local commit because ${localCheck.reason}.`,
         ]
       : [
           "You most likely ran `git pull` directly. Don't fix this by hand —",
@@ -195,6 +286,11 @@ export function enforceUpgradeTripwire(): void {
       '',
     ].join('\n'),
   );
-  log.error('Upgrade tripwire: install not on the sanctioned path', { code, recorded });
+  log.error('Upgrade tripwire: install not on the sanctioned path', { code, recorded, notLocal: localCheck.reason });
+  // Once per stop, not on every circuit-breaker retry.
+  if (readHostStatus()?.state !== 'blocked') {
+    notifyOperator('NanoClaw stopped', 'Startup blocked by the upgrade check. See logs/nanoclaw.error.log.');
+  }
+  writeHostStatus('blocked', 'upgrade check');
   process.exit(1);
 }

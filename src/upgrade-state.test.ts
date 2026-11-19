@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { execFileSync } from 'child_process';
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
@@ -8,9 +9,17 @@ vi.mock('./config.js', async () => {
   return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-upgrade-state' };
 });
 
+// Real desktop notifications must not pop up during a test run.
+vi.mock('./host-status.js', async () => {
+  const actual = await vi.importActual<typeof import('./host-status.js')>('./host-status.js');
+  return { ...actual, notifyOperator: vi.fn() };
+});
+
 const TEST_DIR = '/tmp/nanoclaw-test-upgrade-state';
 
+import { notifyOperator, readHostStatus } from './host-status.js';
 import {
+  checkLocalCommits,
   enforceUpgradeTripwire,
   getCodeIdentity,
   getCodeVersion,
@@ -148,5 +157,108 @@ describe('git-less runtimes', () => {
   it('a marker recorded without Git still trips where Git identifies the checkout', () => {
     writeMarker({ version: getCodeVersion(), commit: 'unknown', tree: 'unknown' });
     expect(isUpgradeCurrent()).toBe(false);
+  });
+});
+
+describe('local commits', () => {
+  let root: string;
+
+  const git = (...args: string[]): string =>
+    execFileSync(
+      'git',
+      ['-c', 'user.name=test', '-c', 'user.email=test@example.com', '-c', 'commit.gpgsign=false', ...args],
+      { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+    ).trim();
+
+  function commitFile(file: string, content: string): void {
+    fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+    fs.writeFileSync(path.join(root, file), content);
+    git('add', '-A');
+    git('commit', '-q', '--no-verify', '-m', `change ${file}`);
+  }
+
+  function expectTrip(): void {
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`exit:${code}`);
+    }) as never);
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(() => enforceUpgradeTripwire(root)).toThrow('exit:1');
+    } finally {
+      exitSpy.mockRestore();
+      errSpy.mockRestore();
+    }
+  }
+
+  // A stamped checkout whose official remote has seen the stamped commit.
+  beforeEach(() => {
+    root = fs.mkdtempSync('/tmp/nanoclaw-local-commits-');
+    git('init', '-q', '-b', 'main');
+    commitFile('package.json', JSON.stringify({ version: '1.0.0' }));
+    git('remote', 'add', 'upstream', 'https://github.com/nanocoai/nanoclaw.git');
+    git('update-ref', 'refs/remotes/upstream/main', 'HEAD');
+    writeUpgradeState({ via: 'test', projectRoot: root });
+    vi.mocked(notifyOperator).mockClear();
+  });
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('accepts a local commit and re-stamps the marker to it', () => {
+    commitFile('tools/gateway.mjs', 'export {};\n');
+    expect(checkLocalCommits(root)).toMatchObject({ local: true });
+
+    expect(() => enforceUpgradeTripwire(root)).not.toThrow();
+    expect(readUpgradeState()).toMatchObject({ commit: git('rev-parse', 'HEAD'), via: 'local-commit' });
+    expect(isUpgradeCurrent(root)).toBe(true);
+  });
+
+  it('finds the official remote by URL when it is not named upstream', () => {
+    git('remote', 'rename', 'upstream', 'origin');
+    git('remote', 'set-url', 'origin', 'https://github.com/qwibitai/NanoClaw.git');
+    commitFile('tools/gateway.mjs', 'export {};\n');
+    expect(checkLocalCommits(root)).toMatchObject({ local: true });
+  });
+
+  it('trips on a commit that touches a gated path', () => {
+    commitFile('src/db/migrations/099-local.ts', 'export {};\n');
+    expect(checkLocalCommits(root)).toEqual({ local: false, reason: 'they change src/db/migrations/099-local.ts' });
+    expectTrip();
+  });
+
+  it('trips on commits that come from the official remote', () => {
+    commitFile('src/router.ts', 'export {};\n');
+    git('update-ref', 'refs/remotes/upstream/main', 'HEAD');
+    expect(checkLocalCommits(root)).toEqual({ local: false, reason: '1 commit(s) come from upstream' });
+  });
+
+  it('trips on a merge', () => {
+    git('checkout', '-q', '-b', 'side');
+    commitFile('tools/side.mjs', 'export {};\n');
+    git('checkout', '-q', 'main');
+    commitFile('tools/main.mjs', 'export {};\n');
+    git('merge', '-q', '--no-ff', '--no-edit', '--no-verify', 'side');
+    expect(checkLocalCommits(root)).toEqual({ local: false, reason: 'a merge brought in other history' });
+  });
+
+  it('trips when the recorded commit was rewritten away', () => {
+    commitFile('tools/gateway.mjs', 'export {};\n');
+    writeUpgradeState({ via: 'test', projectRoot: root });
+    git('commit', '-q', '--amend', '--no-verify', '-m', 'reworded');
+    expect(checkLocalCommits(root)).toMatchObject({ local: false, reason: expect.stringContaining('not an ancestor') });
+  });
+
+  it('trips when there is no official remote to compare against', () => {
+    git('remote', 'remove', 'upstream');
+    commitFile('tools/gateway.mjs', 'export {};\n');
+    expect(checkLocalCommits(root)).toMatchObject({ local: false, reason: expect.stringContaining('no official') });
+  });
+
+  it('notifies once per stop and leaves the host status blocked', () => {
+    commitFile('package.json', JSON.stringify({ version: '1.0.1' }));
+    expectTrip();
+    expectTrip();
+    expect(notifyOperator).toHaveBeenCalledTimes(1);
+    expect(readHostStatus()).toMatchObject({ state: 'blocked', reason: 'upgrade check' });
   });
 });

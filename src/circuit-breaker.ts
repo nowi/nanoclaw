@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR } from './config.js';
+import { notifyOperator, readHostStatus } from './host-status.js';
 import { log } from './log.js';
 
 const CB_PATH = path.join(DATA_DIR, 'circuit-breaker.json');
@@ -80,6 +81,11 @@ export async function enforceStartupBackoff(): Promise<void> {
       delaySec,
       resumeAt,
     });
+    // Once per crash loop, on its first delayed attempt — unless a startup
+    // gate already said why (its stop climbs the breaker too).
+    if (getDelay(attempt - 1) === 0 && readHostStatus()?.state !== 'blocked') {
+      notifyOperator('NanoClaw keeps crashing', 'Restarting with backoff. See logs/nanoclaw.error.log.');
+    }
     await new Promise((resolve) => setTimeout(resolve, delaySec * 1000));
     log.info('Circuit breaker: backoff complete, resuming startup', { attempt });
   }

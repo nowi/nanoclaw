@@ -18,6 +18,7 @@ import { startHostModules, stopHostModules } from './host-lifecycle.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
 import { enforceUpgradeTripwire } from './upgrade-state.js';
+import { clearHostStatus, writeHostStatus } from './host-status.js';
 
 // Response registry lives in response-registry.ts to break the
 // circular import cycle: src/index.ts imports src/modules/index.js for side
@@ -69,6 +70,8 @@ async function main(): Promise<void> {
   // 0.5 Upgrade tripwire — refuse to start if this install was updated
   // outside the sanctioned path (raw `git pull` instead of /update-nanoclaw).
   enforceUpgradeTripwire();
+  // Past the gates: clears a 'blocked' left by an earlier stopped start.
+  writeHostStatus('starting');
 
   // 1. Init central DB
   const db = await initDb(CENTRAL_DB_PATH, { role: 'host' });
@@ -170,6 +173,7 @@ async function main(): Promise<void> {
   // 8. Start the `ncl` CLI socket server (data/ncl.sock).
   await startCliServer();
 
+  writeHostStatus('running');
   log.info('NanoClaw running');
 }
 
@@ -191,6 +195,7 @@ async function shutdown(signal: string): Promise<void> {
     // via SIGTERM/SIGINT, not a crash, so the next start shouldn't be counted
     // as one.
     resetCircuitBreaker();
+    clearHostStatus();
     process.exit(0);
   }
 }

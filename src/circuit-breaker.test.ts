@@ -30,7 +30,13 @@ vi.mock('./log.js', () => ({
   },
 }));
 
+vi.mock('./host-status.js', async () => {
+  const actual = await vi.importActual<typeof import('./host-status.js')>('./host-status.js');
+  return { ...actual, notifyOperator: vi.fn() };
+});
+
 import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
+import { notifyOperator, writeHostStatus } from './host-status.js';
 
 function readState(): { attempt: number; timestamp: string } {
   return JSON.parse(fs.readFileSync(CB_PATH, 'utf-8'));
@@ -170,6 +176,33 @@ describe('enforceStartupBackoff — backoff schedule', () => {
       expect(maxDelayMs).toBe(expectedDelaySec * 1000);
     });
   }
+});
+
+describe('enforceStartupBackoff — operator notification', () => {
+  async function startAfter(priorAttempt: number): Promise<void> {
+    seedState(priorAttempt);
+    vi.useFakeTimers();
+    const promise = enforceStartupBackoff();
+    await vi.runAllTimersAsync();
+    await promise;
+  }
+
+  beforeEach(() => vi.mocked(notifyOperator).mockClear());
+
+  it('notifies on the first delayed attempt only', async () => {
+    await startAfter(1);
+    expect(notifyOperator).not.toHaveBeenCalled();
+    await startAfter(2);
+    expect(notifyOperator).toHaveBeenCalledTimes(1);
+    await startAfter(3);
+    expect(notifyOperator).toHaveBeenCalledTimes(1);
+  });
+
+  it('stays quiet when a startup gate already reported the stop', async () => {
+    writeHostStatus('blocked', 'upgrade check');
+    await startAfter(2);
+    expect(notifyOperator).not.toHaveBeenCalled();
+  });
 });
 
 describe('enforceStartupBackoff — fresh install (DATA_DIR missing)', () => {

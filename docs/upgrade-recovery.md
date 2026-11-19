@@ -37,11 +37,33 @@ Once it finishes it stamps the marker for you, and the next start is clean.
 
 ## If you committed a local customization
 
-An intentional local commit changes the checkout identity too. First verify the
-commit contains only the customization you intended and run the same build,
-tests, migrations, and image work that `/update-nanoclaw` would require. Then
-stamp the reviewed checkout with the override below. Do not run
-`/update-nanoclaw` just to erase or replace a local customization.
+An intentional local commit changes the checkout identity too. The host accepts
+it on its own, re-stamps the marker (`via: "local-commit"`) and logs a warning,
+when everything since the recorded commit is:
+
+- linear commits on top of it (no merge, rebase, or reset),
+- at the same `package.json` version,
+- not reachable from the official remote (`upstream`, or the remote whose URL
+  is `nanocoai/nanoclaw` or the older `qwibitai/nanoclaw`), which must have
+  been fetched at least once,
+- free of changes that need the supported flow's work: `src/db/migrations/`,
+  `package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml`,
+  `container/Dockerfile`, `container/agent-runner/package.json`, or
+  `container/agent-runner/bun.lock`.
+
+Anything else still trips, and the stop message says which rule the commits
+broke. Then verify the commit contains only the customization you intended and
+run the same build, tests, migrations, and image work that `/update-nanoclaw`
+would require. Then stamp the reviewed checkout with the override below. Do
+not run `/update-nanoclaw` just to erase or replace a local customization.
+
+## Noticing a stop
+
+A stopped host keeps a live process (it sleeps between circuit-breaker
+retries), so "the service is loaded" does not mean it is serving. The host
+writes `data/host-status.json` (`blocked`, `starting`, or `running`, with its
+pid) for tools such as the macOS menu-bar app, and on macOS posts one desktop
+notification when the tripwire stops it or a crash loop starts backing off.
 
 ## If Git is unavailable
 
