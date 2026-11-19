@@ -12,6 +12,7 @@ vi.mock('./backfill-container-configs.js', () => ({ backfillContainerConfigs: vi
 vi.mock('./config.js', () => ({ CENTRAL_DB_PATH: ':memory:' }));
 vi.mock('./circuit-breaker.js', () => ({ enforceStartupBackoff: vi.fn(), resetCircuitBreaker: vi.fn() }));
 vi.mock('./upgrade-state.js', () => ({ enforceUpgradeTripwire: vi.fn() }));
+vi.mock('./host-status.js', () => ({ writeHostStatus: vi.fn(), clearHostStatus: vi.fn() }));
 vi.mock('./db/connection.js', () => ({ initDb: async () => ({ dialect: 'sqlite' }), closeDb: vi.fn() }));
 vi.mock('./db/migrations/index.js', () => ({ runMigrations: vi.fn() }));
 vi.mock('./drivers/index.js', () => ({ getSessionDriver: () => ({ ensureReady: vi.fn() }) }));
