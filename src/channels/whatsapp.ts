@@ -42,7 +42,15 @@ import { isSafeAttachmentName } from '../attachment-safety.js';
 import { DATA_DIR } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
+import { transcribeVoiceNote, withVoiceTranscript } from '../transcription.js';
 import { registerChannelAdapter } from './channel-registry.js';
+import {
+  InboundKeyCache,
+  bareWhatsAppMessageId,
+  reactionToOptionValue,
+  toReactionEmoji,
+} from './whatsapp-reactions.js';
+import { assistantNameFor, hasAssistantPrefix, parseAssistantNameByChat } from './whatsapp-names.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
 import type {
   ChannelAdapter,
@@ -107,10 +115,47 @@ const GROUP_METADATA_CACHE_TTL_MS = 60_000; // 1 min for outbound sends
 const SENT_MESSAGE_CACHE_MAX = 256;
 const RECONNECT_DELAY_MS = 5000;
 const PENDING_QUESTIONS_MAX = 64;
+/**
+ * Cap on inbound media bytes we inline for inbox staging (mirrors the iMessage
+ * adapter's cap). Above it the bytes stay in the host archive only and the
+ * agent gets a note instead of a file. Override with
+ * WHATSAPP_MAX_INLINE_ATTACHMENT_BYTES.
+ */
+const DEFAULT_MAX_INLINE_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 
-/** Normalize an option label to a slash command: "Approve" → "/approve" */
-function optionToCommand(option: string): string {
-  return '/' + option.toLowerCase().replace(/\s+/g, '-');
+/**
+ * Slash commands for a question's option labels, positionally aligned with the
+ * input.
+ *
+ * Labels are presentation text and may contain characters a person cannot
+ * reasonably type. The shared approval card ends its third label with U+2026
+ * ("Reject with reason…"), which produced the untypeable `/reject-with-reason…`
+ * — the reply was matched by exact equality, so plain ASCII never hit it.
+ * Everything outside [a-z0-9-] is therefore dropped.
+ *
+ * That makes the mapping lossy, so two labels can collide ("Yes" and "Yes!"),
+ * and a collision would silently resolve whichever option came first — hence
+ * the numeric suffix, and the positional fallback for a label that sanitizes
+ * to nothing.
+ */
+export function optionCommands(labels: string[]): string[] {
+  const used = new Set<string>();
+  return labels.map((label, index) => {
+    const slug = label
+      .toLowerCase()
+      .replace(/\s+/g, '-')
+      .replace(/[^a-z0-9-]/g, '')
+      .replace(/-{2,}/g, '-')
+      .replace(/^-+|-+$/g, '');
+    let command = slug ? `/${slug}` : `/${index + 1}`;
+    if (used.has(command)) {
+      let suffix = 2;
+      while (used.has(`${command}-${suffix}`)) suffix++;
+      command = `${command}-${suffix}`;
+    }
+    used.add(command);
+    return command;
+  });
 }
 
 // --- Markdown → WhatsApp formatting ---
@@ -335,9 +380,65 @@ export function rewriteBotLidMention(
  * empty-message guard. Returns `content` unchanged when nothing failed.
  */
 export function appendMediaFailureNote(content: string, failures: string[]): string {
-  if (failures.length === 0) return content;
-  const note = failures.map((t) => `[${t} could not be downloaded]`).join(' ');
+  return appendMediaNotes(
+    content,
+    failures.map((t) => `[${t} could not be downloaded]`),
+  );
+}
+
+/**
+ * Append pre-rendered media notes to the message text. Used for media we
+ * fetched but deliberately did not hand to the agent (over the inline cap) —
+ * silence there would look like the attachment was never sent.
+ */
+export function appendMediaNotes(content: string, notes: string[]): string {
+  if (notes.length === 0) return content;
+  const note = notes.join(' ');
   return content ? `${content}\n${note}` : note;
+}
+
+/** One inbound attachment as the host expects it: bytes, never a path. */
+export interface InboundAttachment {
+  type: string;
+  name: string;
+  mimeType?: string;
+  size: number;
+  /** base64. Absent when the media is over the inline cap. */
+  data?: string;
+}
+
+/**
+ * Build the attachment entry the host stages into the session inbox.
+ *
+ * Deliberately emits NO `localPath`: the host owns that field and sets it to a
+ * session-relative `inbox/<messageId>/<file>` path while staging the bytes
+ * (`extractAttachmentFiles` in session-manager). An adapter-supplied
+ * `localPath` would name a host directory that is not mounted into the
+ * container, so the agent would be handed `/workspace/<that>` and find nothing
+ * there — which is exactly how inbound images used to go missing.
+ *
+ * Over the cap we return the entry without `data` plus a note: the agent is
+ * told media arrived and why it cannot open it, rather than being given a
+ * path that does not resolve.
+ */
+export function buildInboundAttachment(
+  type: string,
+  filename: string,
+  mimeType: string | undefined,
+  buffer: Buffer,
+  cap: number,
+): { entry: InboundAttachment; note?: string } {
+  const entry: InboundAttachment = {
+    type,
+    name: filename,
+    ...(mimeType ? { mimeType } : {}),
+    size: buffer.length,
+  };
+  if (buffer.length > cap) {
+    return { entry, note: `[${type} ${filename} too large to attach (${Math.round(buffer.length / 1024)} KB)]` };
+  }
+  entry.data = buffer.toString('base64');
+  return { entry };
 }
 
 /** Map file extension to Baileys media message type. */
@@ -400,10 +501,20 @@ export function computeWhatsappDefaults(shared: boolean): ChannelDefaults {
 // Adapter-internal env: same .env keys as always (setup/channels/whatsapp.ts
 // still writes them), but read here instead of imported from core config —
 // shared-number handling is channel-local.
-const waEnv = readEnvFile(['ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER']);
+const waEnv = readEnvFile([
+  'ASSISTANT_NAME',
+  'ASSISTANT_HAS_OWN_NUMBER',
+  'ASSISTANT_NAME_BY_CHAT',
+  'WHATSAPP_MAX_INLINE_ATTACHMENT_BYTES',
+]);
 const ASSISTANT_NAME = waEnv.ASSISTANT_NAME || 'Andy';
+// Local customization (nowi): per-chat names, see whatsapp-names.ts.
+const ASSISTANT_NAME_BY_CHAT = parseAssistantNameByChat(waEnv.ASSISTANT_NAME_BY_CHAT);
 const WHATSAPP_SHARED = resolveSharedMode(waEnv.ASSISTANT_HAS_OWN_NUMBER);
 const WHATSAPP_DEFAULTS: ChannelDefaults = computeWhatsappDefaults(WHATSAPP_SHARED);
+const maxInlineBytes =
+  Number(process.env.WHATSAPP_MAX_INLINE_ATTACHMENT_BYTES || waEnv.WHATSAPP_MAX_INLINE_ATTACHMENT_BYTES) ||
+  DEFAULT_MAX_INLINE_ATTACHMENT_BYTES;
 
 registerChannelAdapter('whatsapp', {
   factory: () => {
@@ -434,6 +545,9 @@ registerChannelAdapter('whatsapp', {
 
     // Sent message cache for retry/re-encrypt requests
     const sentMessageCache = new Map<string, any>();
+    // Local customization (nowi): real keys of forwarded inbound messages, so
+    // agent reactions can target them (see whatsapp-reactions.ts).
+    const inboundKeyCache = new InboundKeyCache();
 
     // Group metadata cache with TTL
     const groupMetadataCache = new Map<string, { metadata: GroupMetadata; expiresAt: number }>();
@@ -445,6 +559,10 @@ registerChannelAdapter('whatsapp', {
       {
         questionId: string;
         options: NormalizedOption[];
+        /** Exactly the commands rendered into the card, so replies cannot drift. */
+        commands: string[];
+        /** Platform id of the card message, so a reaction can name its target. */
+        messageId?: string;
       }
     >();
 
@@ -567,14 +685,35 @@ registerChannelAdapter('whatsapp', {
       }
     }
 
-    /** Download media from an inbound message, save to /workspace/attachments/. */
+    /**
+     * Download media from an inbound message.
+     *
+     * The bytes have two consumers with two different views of the filesystem,
+     * so they are returned two ways:
+     *
+     *  - `hostPaths` (filename → absolute path under `DATA_DIR/attachments/`) —
+     *    the host-side archive. Voice-note transcription runs here on the host
+     *    with whisper.cpp and needs a real file. The container never sees this
+     *    tree: it is not mounted, by design.
+     *  - the attachment entry's base64 `data` — the host stages this into the
+     *    session's inbox (`extractAttachmentFiles` in session-manager) and
+     *    rewrites the entry to a `localPath` under `/workspace`, the only tree
+     *    the container can read.
+     *
+     * Emitting a `localPath` from here is what broke image reading: it named a
+     * host path (`attachments/<file>`) that the formatter turned into
+     * `/workspace/attachments/<file>`, which does not exist inside the
+     * container. The host owns `localPath`; an adapter passes bytes.
+     */
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     async function downloadInboundMedia(
       msg: WAMessage,
       normalized: any,
     ): Promise<{
-      attachments: Array<{ type: string; name: string; localPath: string }>;
+      attachments: InboundAttachment[];
       failures: string[];
+      notes: string[];
+      hostPaths: Map<string, string>;
     }> {
       const mediaTypes: Array<{ key: string; type: string; ext: string }> = [
         { key: 'imageMessage', type: 'image', ext: '.jpg' },
@@ -582,8 +721,10 @@ registerChannelAdapter('whatsapp', {
         { key: 'audioMessage', type: 'audio', ext: '.ogg' },
         { key: 'documentMessage', type: 'document', ext: '' },
       ];
-      const results: Array<{ type: string; name: string; localPath: string }> = [];
+      const results: InboundAttachment[] = [];
       const failures: string[] = [];
+      const notes: string[] = [];
+      const hostPaths = new Map<string, string>();
       for (const { key, type, ext } of mediaTypes) {
         if (!normalized[key]) continue;
         try {
@@ -613,14 +754,27 @@ registerChannelAdapter('whatsapp', {
           fs.mkdirSync(attachDir, { recursive: true });
           const filePath = path.join(attachDir, filename);
           fs.writeFileSync(filePath, buffer);
-          results.push({ type, name: filename, localPath: `attachments/${filename}` });
-          log.info('Media downloaded', { type, filename });
+          hostPaths.set(filename, filePath);
+          const mimeType = typeof normalized[key].mimetype === 'string' ? normalized[key].mimetype : undefined;
+          const { entry, note } = buildInboundAttachment(type, filename, mimeType, buffer, maxInlineBytes);
+          if (note) {
+            // Over the cap: the archive keeps the bytes, the agent gets the note.
+            notes.push(note);
+            log.warn('Inbound media over inline cap, not staged for the agent', {
+              type,
+              filename,
+              size: buffer.length,
+              cap: maxInlineBytes,
+            });
+          }
+          results.push(entry);
+          log.info('Media downloaded', { type, filename, size: buffer.length, staged: entry.data !== undefined });
         } catch (err) {
           log.warn('Failed to download media', { type, err });
           failures.push(type);
         }
       }
-      return { attachments: results, failures };
+      return { attachments: results, failures, notes, hostPaths };
     }
 
     async function sendRawMessage(jid: string, text: string, mentions?: string[]): Promise<string | undefined> {
@@ -856,12 +1010,65 @@ registerChannelAdapter('whatsapp', {
             content = rewriteBotLidMention(content, WHATSAPP_SHARED, botLidUser, ASSISTANT_NAME);
 
             // Download media attachments (images, video, audio, documents)
-            const { attachments, failures } = await downloadInboundMedia(msg, normalized);
+            const { attachments, failures, notes, hostPaths } = await downloadInboundMedia(msg, normalized);
 
             // Surface failed downloads as text so the agent knows media was
             // sent even when it couldn't be fetched — instead of silently
             // dropping the attachment (or the whole message, if uncaptioned).
             content = appendMediaFailureNote(content, failures);
+            content = appendMediaNotes(content, notes);
+
+            // Local customization (v1 parity, nowi): voice notes are
+            // transcribed on the host with whisper.cpp and delivered as
+            // `[Voice: …]` text — the agent can't listen to the .ogg.
+            if (normalized.audioMessage?.ptt === true) {
+              const audio = attachments.find((a) => a.type === 'audio');
+              const audioPath = audio ? hostPaths.get(audio.name) : undefined;
+              const transcript = audioPath ? await transcribeVoiceNote(audioPath) : null;
+              content = withVoiceTranscript(content, transcript);
+              log.info('Voice note processed', {
+                chatJid,
+                transcribed: transcript !== null,
+                chars: transcript?.length ?? 0,
+              });
+            }
+
+            // A reaction on a pending question card answers it: 👍 approve,
+            // 👎 reject. Must run before the empty-message drop below, because
+            // a reaction carries no text of its own.
+            //
+            // DMs only. Approval cards are always delivered to the approver's
+            // DM, so this loses nothing — and in a group any member could react,
+            // which would clear the card locally before the host got to reject
+            // them as unauthorized.
+            const reaction = normalized.reactionMessage ?? msg.message?.reactionMessage;
+            if (reaction?.text && reaction.key?.id) {
+              const botsOwnReaction = sentMessageCache.has(msg.key.id || '');
+              const card = pendingQuestions.get(chatJid);
+              const value = reactionToOptionValue(reaction.text);
+              if (!botsOwnReaction && !isGroup && card && value && card.messageId === reaction.key.id) {
+                const matched = card.options.find((o) => o.value === value);
+                if (matched) {
+                  const rawReactor = msg.key.participant || msg.key.remoteJid || '';
+                  const reactor = rawReactor.endsWith('@lid')
+                    ? await translateJid(rawReactor, msg.key.participantAlt)
+                    : rawReactor;
+                  const voterName = msg.pushName || reactor.split('@')[0];
+                  // Authorization stays in core: onAction → dispatchResponse →
+                  // isAuthorizedApprovalClick checks the reactor against the
+                  // approval's approver_user_id.
+                  setupConfig.onAction(card.questionId, matched.value, reactor);
+                  pendingQuestions.delete(chatJid);
+                  await sendRawMessage(chatJid, `${matched.selectedLabel} by ${voterName}`);
+                  log.info('Question answered by reaction', {
+                    questionId: card.questionId,
+                    value: matched.value,
+                    emoji: reaction.text,
+                  });
+                }
+              }
+              continue; // a reaction is never forwarded to the agent
+            }
 
             // Skip empty protocol messages (no text and no attachments)
             if (!content && attachments.length === 0) continue;
@@ -881,17 +1088,29 @@ registerChannelAdapter('whatsapp', {
             // the agent in third-party conversations.
             if (fromMe) {
               const isSelfChat = botPhoneJid && chatJid === botPhoneJid;
-              if (!isSelfChat) continue;
+              // Local customization (v1 parity, nowi): the operator's own
+              // posts in groups also reach the router, which drops unwired
+              // groups (shared mode never auto-creates). Third-party DMs
+              // the operator answers from their phone are still skipped.
+              if (!isSelfChat && !isGroup) continue;
+              // Bot echoes: sent-cache first, then the shared-mode name
+              // prefix as a fallback for sends the cache has evicted.
               if (sentMessageCache.has(msg.key.id || '')) continue;
+              if (WHATSAPP_SHARED && hasAssistantPrefix(content, ASSISTANT_NAME_BY_CHAT, ASSISTANT_NAME)) continue;
             }
 
-            const isBotMessage = WHATSAPP_SHARED ? content.startsWith(`${ASSISTANT_NAME}:`) : false;
+            inboundKeyCache.remember(msg.key);
+
+            const isBotMessage = WHATSAPP_SHARED
+              ? hasAssistantPrefix(content, ASSISTANT_NAME_BY_CHAT, ASSISTANT_NAME)
+              : false;
 
             // Check if this reply answers a pending question via slash command
             const pending = pendingQuestions.get(chatJid);
             if (pending && content.startsWith('/')) {
               const cmd = content.trim().toLowerCase();
-              const matched = pending.options.find((o) => optionToCommand(o.label) === cmd);
+              const matchedIndex = pending.commands.indexOf(cmd);
+              const matched = matchedIndex < 0 ? undefined : pending.options[matchedIndex];
               if (matched) {
                 const voterName = msg.pushName || sender.split('@')[0];
                 setupConfig.onAction(pending.questionId, matched.value, sender);
@@ -1005,11 +1224,12 @@ registerChannelAdapter('whatsapp', {
           }
           const options: NormalizedOption[] = normalizeOptions(content.options as never);
 
-          const optionLines = options.map((o) => `  ${optionToCommand(o.label)}`).join('\n');
+          const commands = optionCommands(options.map((o) => o.label));
+          const optionLines = commands.map((command) => `  ${command}`).join('\n');
           const text = `*${title}*\n\n${question}\n\nReply with:\n${optionLines}`;
           const msgId = await sendRawMessage(platformId, text);
           if (msgId) {
-            pendingQuestions.set(platformId, { questionId, options });
+            pendingQuestions.set(platformId, { questionId, options, commands, messageId: msgId });
             if (pendingQuestions.size > PENDING_QUESTIONS_MAX) {
               const oldest = pendingQuestions.keys().next().value!;
               pendingQuestions.delete(oldest);
@@ -1020,15 +1240,26 @@ registerChannelAdapter('whatsapp', {
 
         // Reaction → emoji on a message
         if (content.operation === 'reaction' && content.messageId && content.emoji) {
+          // Local customization (nowi): resolve the bare WhatsApp id, the real
+          // key (fromMe/participant) and the emoji character — trunk sent the
+          // namespaced id, a shortcode, and fromMe:false, so reactions never
+          // appeared on the operator's own messages.
+          const waId = bareWhatsAppMessageId(String(content.messageId));
+          const emoji = toReactionEmoji(String(content.emoji));
+          if (!emoji) {
+            log.warn('Reaction skipped — unknown emoji name', { platformId, emoji: content.emoji });
+            return;
+          }
+          const key = inboundKeyCache.get(waId) ?? { remoteJid: platformId, id: waId, fromMe: false };
           try {
-            await sock.sendMessage(platformId, {
-              react: {
-                text: content.emoji as string,
-                key: { remoteJid: platformId, id: content.messageId as string, fromMe: false },
-              },
-            });
+            const sentReaction = await sock.sendMessage(platformId, { react: { text: emoji, key } });
+            // Record it: on a shared number the bot's own reaction echoes back
+            // with fromMe=true exactly like the operator's, and the sent-cache
+            // is the only thing that tells them apart.
+            if (sentReaction?.key?.id) sentMessageCache.set(sentReaction.key.id, sentReaction.message ?? {});
+            log.info('Reaction sent', { platformId, messageId: waId, emoji, fromMe: key.fromMe });
           } catch (err) {
-            log.debug('Failed to send reaction', { platformId, err });
+            log.warn('Failed to send reaction', { platformId, messageId: waId, emoji, err });
           }
           return;
         }
@@ -1068,7 +1299,9 @@ registerChannelAdapter('whatsapp', {
 
         if (text) {
           const { text: formatted, mentions } = formatWhatsApp(text);
-          const prefixed = WHATSAPP_SHARED ? `${ASSISTANT_NAME}: ${formatted}` : formatted;
+          const prefixed = WHATSAPP_SHARED
+            ? `${assistantNameFor(platformId, ASSISTANT_NAME_BY_CHAT, ASSISTANT_NAME)}: ${formatted}`
+            : formatted;
           return sendRawMessage(platformId, prefixed, mentions);
         }
       },
