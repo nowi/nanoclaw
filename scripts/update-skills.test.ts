@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { detectInstalledSkills, refreshInstalledSkills } from './update-skills.js';
 
@@ -34,7 +34,15 @@ function commit(root: string, message: string): void {
   run(root, 'git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', message]);
 }
 
+// The operator's registry override (set while an update runs) must not
+// steer these fixtures' remote resolution.
+beforeEach(() => {
+  vi.stubEnv('NANOCLAW_REGISTRY_REMOTE', undefined);
+  vi.stubEnv('NANOCLAW_CHANNELS_REMOTE', undefined);
+});
+
 afterEach(() => {
+  vi.unstubAllEnvs();
   for (const root of tempRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
